@@ -8,31 +8,19 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use chrono::{Datelike, Duration, NaiveDate, Timelike};
+use chrono::{Duration, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
+use super::canvas::*;
 use crate::timeline::{
     LaneState, Machine, Projection, ProjectionKind, Release, ReleaseKind, Shape, Tier, Upstream,
     VersionMarks,
 };
 
 // The dashboard palette, plus the timeline's own accents.
-const GATED: Color = Color::Rgb(0xf5, 0x9e, 0x0b);
-const BAD: Color = Color::Rgb(0xef, 0x44, 0x44);
-const GOOD: Color = Color::Rgb(0x22, 0xc5, 0x5e);
-const AUTO: Color = Color::Rgb(0x38, 0xbd, 0xf8);
-const MUTED: Color = Color::Rgb(0x94, 0xa3, 0xb8);
-const FAINT: Color = Color::Rgb(0x47, 0x55, 0x69);
-const GHOST: Color = Color::Rgb(0x64, 0x74, 0x8b);
-const ACCENT: Color = Color::Rgb(0xa7, 0x8b, 0xfa);
-const TODAY: Color = Color::Rgb(0xf4, 0x72, 0xb6);
-const STAR: Color = Color::Rgb(0xfa, 0xcc, 0x15);
-const CURSOR_BG: Color = Color::Rgb(0x1e, 0x29, 0x3b);
-const WHITE: Color = Color::Rgb(0xf8, 0xfa, 0xfc);
-
 pub const MAX_INFO: u8 = 3;
 
 /// Where and when a lane is being drawn.
@@ -45,8 +33,6 @@ struct Band {
 }
 const MIN_SCALE: f64 = 0.15;
 const MAX_SCALE: f64 = 90.0;
-const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
 pub enum ShapeState {
     Loading,
     Ready(Shape),
@@ -116,12 +102,8 @@ pub struct TimelineView {
     pub reading_machine: bool,
     rows: Vec<RowKind>,
 
-    /// Viewport: the day at the centre of the plot and days per column, each
-    /// easing toward its target so movement is animated rather than jumped.
-    center: f64,
-    target_center: f64,
-    scale: f64,
-    target_scale: f64,
+    /// The window onto time, easing as it pans and zooms.
+    vp: Viewport,
 
     row: usize,
     item: usize,
@@ -131,43 +113,7 @@ pub struct TimelineView {
     fitted: bool,
     drag: Option<(u16, f64)>,
     hits: Vec<(Rect, Hit)>,
-    plot: Rect,
     row_y: Vec<(u16, u16, usize)>,
-}
-
-/// Where an instant sits on the axis: its local day plus the fraction of it.
-fn when(t: chrono::DateTime<chrono::Utc>) -> f64 {
-    let local = t.with_timezone(&chrono::Local);
-    day(local.date_naive()) + f64::from(local.num_seconds_from_midnight()) / 86_400.0
-}
-
-fn day(d: NaiveDate) -> f64 {
-    f64::from(d.num_days_from_ce())
-}
-
-fn date_of(x: f64) -> NaiveDate {
-    NaiveDate::from_num_days_from_ce_opt(x.round() as i32).unwrap_or_default()
-}
-
-fn today() -> NaiveDate {
-    chrono::Local::now().date_naive()
-}
-
-fn ease_out(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(3)
-}
-
-fn mix(a: Color, b: Color, t: f64) -> Color {
-    match (a, b) {
-        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
-            let l = |x: u8, y: u8| {
-                (f64::from(x) + (f64::from(y) - f64::from(x)) * t.clamp(0.0, 1.0)) as u8
-            };
-            Color::Rgb(l(r1, r2), l(g1, g2), l(b1, b2))
-        }
-        _ => b,
-    }
 }
 
 impl TimelineView {
@@ -177,10 +123,7 @@ impl TimelineView {
             sources,
             reading_machine: false,
             rows: Vec::new(),
-            center: day(today()),
-            target_center: day(today()),
-            scale: 3.0,
-            target_scale: 3.0,
+            vp: Viewport::new(day(today()), 3.0, MIN_SCALE, MAX_SCALE),
             row: 0,
             item: 0,
             info: info.min(MAX_INFO),
@@ -188,7 +131,6 @@ impl TimelineView {
             fitted: false,
             drag: None,
             hits: Vec::new(),
-            plot: Rect::default(),
             row_y: Vec::new(),
         };
         v.rebuild_rows();
@@ -249,7 +191,7 @@ impl TimelineView {
             self.focus_current();
             self.fit_around_selection();
             // Arrive from slightly zoomed out, so the view settles into place.
-            self.scale = self.target_scale * 1.8;
+            self.vp.scale = self.vp.target_scale * 1.8;
             self.born = Instant::now();
         } else if let Some(sel) = selected {
             self.select_ref(&sel);
@@ -278,22 +220,12 @@ impl TimelineView {
 
     /// Whether the next frame should come soon: something is moving.
     pub fn animating(&self) -> bool {
-        let settling = (self.center - self.target_center).abs() > 0.05
-            || (self.scale / self.target_scale - 1.0).abs() > 0.002;
-        settling || self.born.elapsed().as_millis() < 900 || self.loading()
+        self.vp.settling() || self.born.elapsed().as_millis() < 900 || self.loading()
     }
 
     /// Advance the easing by one frame.
     pub fn step(&mut self) {
-        let k = 0.28;
-        self.center += (self.target_center - self.center) * k;
-        self.scale *= (self.target_scale / self.scale).powf(k);
-        if (self.center - self.target_center).abs() < 0.05 {
-            self.center = self.target_center;
-        }
-        if (self.scale / self.target_scale - 1.0).abs() < 0.002 {
-            self.scale = self.target_scale;
-        }
+        self.vp.step();
     }
 
     // -----------------------------------------------------------------------
@@ -531,34 +463,24 @@ impl TimelineView {
     }
 
     fn frame(&mut self, lo: NaiveDate, hi: NaiveDate) {
-        let width = f64::from(self.plot.width.max(40));
-        self.target_center = (day(lo) + day(hi)) / 2.0;
-        self.target_scale = ((day(hi) - day(lo)) / width).clamp(MIN_SCALE, MAX_SCALE);
+        self.vp.frame(day(lo), day(hi));
     }
 
     fn ensure_visible(&mut self) {
-        let Some(x) = self.selected_x() else {
-            return;
-        };
-        let half = f64::from(self.plot.width.max(20)) / 2.0 * self.target_scale;
-        let margin = half * 0.8;
-        if (x - self.target_center).abs() > margin {
-            self.target_center = x - margin.copysign(x - self.target_center) * 0.5;
+        if let Some(x) = self.selected_x() {
+            self.vp.ensure_visible(x);
         }
     }
 
     fn zoom(&mut self, factor: f64, anchor: Option<f64>) {
-        let new_scale = (self.target_scale * factor).clamp(MIN_SCALE, MAX_SCALE);
         let a = anchor
             .or_else(|| self.selected_x())
-            .unwrap_or(self.target_center);
-        // Keep the anchor where it is on screen.
-        self.target_center = a - (a - self.target_center) * (new_scale / self.target_scale);
-        self.target_scale = new_scale;
+            .unwrap_or(self.vp.target_center);
+        self.vp.zoom(factor, a);
     }
 
     fn pan(&mut self, columns: f64) {
-        self.target_center += columns * self.target_scale;
+        self.vp.pan(columns);
     }
 
     fn step_item(&mut self, delta: isize) {
@@ -583,14 +505,14 @@ impl TimelineView {
             .collect();
         // Move straight up or down the canvas: the nearest item in time,
         // preferring one already on screen over a jump to another month.
-        let (lo, hi) = self.visible_days();
+        let (lo, hi) = self.vp.visible_days();
         let nearest = |only_visible: bool| {
             items
                 .iter()
                 .enumerate()
                 .filter(|(_, x)| !only_visible || (lo..=hi).contains(*x))
                 .min_by(|(_, a), (_, b)| {
-                    let at = from.unwrap_or(self.center);
+                    let at = from.unwrap_or(self.vp.center);
                     (**a - at).abs().total_cmp(&(**b - at).abs())
                 })
                 .map(|(i, _)| i)
@@ -618,7 +540,7 @@ impl TimelineView {
     /// Handle a key. Returns false for keys the timeline does not use.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let page = f64::from(self.plot.width.max(20)) / 3.0;
+        let page = f64::from(self.vp.plot.width.max(20)) / 3.0;
         match key.code {
             KeyCode::Left if shift => self.pan(-page),
             KeyCode::Right if shift => self.pan(page),
@@ -642,7 +564,7 @@ impl TimelineView {
             KeyCode::Char('[') => self.info = self.info.saturating_sub(1),
             KeyCode::Enter => self.info = if self.info == MAX_INFO { 1 } else { MAX_INFO },
             KeyCode::Char('f') => self.fit_all(),
-            KeyCode::Char('t') => self.target_center = day(today()),
+            KeyCode::Char('t') => self.vp.target_center = day(today()),
             KeyCode::Char('c') => {
                 self.focus_current();
                 self.ensure_visible();
@@ -665,7 +587,7 @@ impl TimelineView {
         let inside = |r: Rect| {
             m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
         };
-        let at = day_at(self, m.column);
+        let at = self.vp.at(m.column);
         match m.kind {
             MouseEventKind::ScrollUp => self.zoom(1.0 / 1.25, Some(at)),
             MouseEventKind::ScrollDown => self.zoom(1.25, Some(at)),
@@ -679,14 +601,14 @@ impl TimelineView {
                         Hit::Less => self.info = self.info.saturating_sub(1),
                         Hit::More => self.info = (self.info + 1).min(MAX_INFO),
                         Hit::Fit => self.fit_all(),
-                        Hit::Today => self.target_center = day(today()),
+                        Hit::Today => self.vp.target_center = day(today()),
                     }
                     return true;
                 }
-                if !inside(self.plot) {
+                if !inside(self.vp.plot) {
                     return false;
                 }
-                self.drag = Some((m.column, self.target_center));
+                self.drag = Some((m.column, self.vp.target_center));
                 // Select what was clicked: the nearest item in that row.
                 if let Some(&(_, _, row)) = self
                     .row_y
@@ -700,7 +622,7 @@ impl TimelineView {
                         .min_by(|(_, (a, _)), (_, (b, _))| {
                             (day(*a) - at).abs().total_cmp(&(day(*b) - at).abs())
                         })
-                        .filter(|(_, (d, _))| (day(*d) - at).abs() <= 3.0 * self.scale.max(1.0))
+                        .filter(|(_, (d, _))| (day(*d) - at).abs() <= 3.0 * self.vp.scale.max(1.0))
                     {
                         self.row = row;
                         self.item = i;
@@ -709,9 +631,10 @@ impl TimelineView {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some((col, center)) = self.drag {
-                    let c = center - f64::from(i32::from(m.column) - i32::from(col)) * self.scale;
-                    self.center = c;
-                    self.target_center = c;
+                    let c =
+                        center - f64::from(i32::from(m.column) - i32::from(col)) * self.vp.scale;
+                    self.vp.center = c;
+                    self.vp.target_center = c;
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => self.drag = None,
@@ -791,7 +714,7 @@ impl TimelineView {
         }
         if self.info >= 2 {
             if let Some(RowKind::Lane { source, lane }) = self.rows.get(self.row).copied() {
-                let (lo, hi) = self.visible_days();
+                let (lo, hi) = self.vp.visible_days();
                 if let Some(l) = self.lane(source, lane) {
                     for r in l
                         .releases
@@ -886,17 +809,6 @@ impl TimelineView {
         }
     }
 
-    fn visible_days(&self) -> (f64, f64) {
-        let half = f64::from(self.plot.width) / 2.0 * self.scale;
-        (self.center - half, self.center + half)
-    }
-
-    fn col(&self, x: f64) -> Option<u16> {
-        let (lo, _) = self.visible_days();
-        let c = ((x - lo) / self.scale).round();
-        (c >= 0.0 && c < f64::from(self.plot.width)).then(|| self.plot.x + c as u16)
-    }
-
     // -----------------------------------------------------------------------
     // Drawing
     // -----------------------------------------------------------------------
@@ -987,7 +899,7 @@ impl TimelineView {
         let buttons: Vec<(String, Option<Hit>, Style)> = vec![
             ("[−]".into(), Some(Hit::ZoomOut), Style::default().fg(AUTO)),
             (
-                format!(" {} ", zoom_label(self.scale)),
+                format!(" {} ", zoom_label(self.vp.scale)),
                 None,
                 Style::default().fg(MUTED),
             ),
@@ -1093,7 +1005,7 @@ impl TimelineView {
         let axis_y = inner.y + 2;
         let rows_top = axis_y + 2;
         let rows_bottom = (inner.y + inner.height).saturating_sub(card_h + 1);
-        self.plot = Rect {
+        self.vp.plot = Rect {
             x: inner.x + label_w,
             y: axis_y,
             width: inner.width.saturating_sub(label_w + 1),
@@ -1102,15 +1014,15 @@ impl TimelineView {
         if !self.fitted && self.loading() {
             // A sensible frame while waiting: the last few months.
             self.frame(today() - Duration::days(120), today() + Duration::days(30));
-            self.center = self.target_center;
-            self.scale = self.target_scale;
+            self.vp.center = self.vp.target_center;
+            self.vp.scale = self.vp.target_scale;
         }
 
         // The intro: the canvas draws itself from left to right.
         let reveal = ease_out(elapsed / 700.0);
-        let reveal_col = self.plot.x + (f64::from(self.plot.width) * reveal) as u16;
+        let reveal_col = self.vp.plot.x + (f64::from(self.vp.plot.width) * reveal) as u16;
 
-        self.draw_axis(buf, axis_y);
+        self.vp.draw_axis(buf, axis_y);
 
         // Rows, scrolled so the selected one stays visible.
         let heights: Vec<u16> = self
@@ -1177,7 +1089,7 @@ impl TimelineView {
         self.draw_cursor(buf, axis_y, rows_bottom);
 
         // The intro's leading edge.
-        if reveal < 0.999 && reveal_col < self.plot.x + self.plot.width {
+        if reveal < 0.999 && reveal_col < self.vp.plot.x + self.vp.plot.width {
             for yy in rows_top..rows_bottom {
                 let cell = &mut buf[(reveal_col, yy)];
                 cell.set_char('▏').set_fg(ACCENT);
@@ -1245,74 +1157,6 @@ impl TimelineView {
         }
     }
 
-    fn draw_axis(&self, buf: &mut Buffer, y: u16) {
-        let (lo, hi) = self.visible_days();
-        let (lo_d, hi_d) = (date_of(lo), date_of(hi));
-        let min_gap = 9.0;
-        // Pick the finest calendar unit whose ticks are far enough apart.
-        let unit_days = [1.0, 7.0, 30.4, 91.3, 182.6, 365.25, 730.5]
-            .into_iter()
-            .find(|u| u / self.scale >= min_gap)
-            .unwrap_or(1461.0);
-        let mut ticks: Vec<(NaiveDate, String, bool)> = Vec::new();
-        if unit_days < 7.5 {
-            let step = unit_days as i64;
-            let mut d = lo_d;
-            if step == 7 {
-                while d.weekday() != chrono::Weekday::Mon {
-                    d += Duration::days(1);
-                }
-            }
-            while d <= hi_d {
-                let major = d.day() <= step as u32;
-                let text = if major || step == 7 {
-                    d.format("%b %-d").to_string()
-                } else {
-                    d.format("%-d").to_string()
-                };
-                ticks.push((d, text, major));
-                d += Duration::days(step);
-            }
-        } else {
-            let months = (unit_days / 30.4).round().max(1.0) as u32;
-            let mut d = NaiveDate::from_ymd_opt(lo_d.year(), lo_d.month(), 1).unwrap_or(lo_d);
-            while d <= hi_d {
-                if (d.month() - 1).is_multiple_of(months.min(12)) || months > 12 {
-                    let major = d.month() == 1;
-                    let text = if months >= 12 || major {
-                        d.format("%Y").to_string()
-                    } else if months >= 3 {
-                        format!("Q{}", (d.month() - 1) / 3 + 1)
-                    } else {
-                        d.format("%b").to_string()
-                    };
-                    if months <= 12 || d.year() % (months / 12) as i32 == 0 {
-                        ticks.push((d, text, major));
-                    }
-                }
-                d = add_months(d, 1);
-            }
-        }
-        let mut last_end = 0u16;
-        for (d, text, major) in ticks {
-            let Some(c) = self.col(day(d)) else { continue };
-            buf[(c, y + 1)]
-                .set_char(if major { '┴' } else { '╵' })
-                .set_fg(if major { MUTED } else { FAINT });
-            if c >= last_end {
-                let style = Style::default().fg(if major { WHITE } else { MUTED });
-                last_end = put(buf, self.plot, c, y, &text, style) + 1;
-            }
-        }
-        // A baseline under the labels.
-        for c in self.plot.x..self.plot.x + self.plot.width {
-            let cell = &mut buf[(c, y + 1)];
-            if cell.symbol() == " " {
-                cell.set_char('─').set_fg(FAINT);
-            }
-        }
-    }
-
     fn draw_lane(&self, buf: &mut Buffer, (source, lane): (usize, usize), band: Band) {
         let Band {
             y,
@@ -1357,8 +1201,8 @@ impl TimelineView {
         for p in &l.projections {
             let from = solid_end.map_or(day(t), day);
             if let (Some(c0), Some(c1)) = (
-                self.col(from.min(day(p.date))),
-                self.col(day(p.date).max(from)),
+                self.vp.col(from.min(day(p.date))),
+                self.vp.col(day(p.date).max(from)),
             ) {
                 for c in c0..=c1 {
                     if c >= reveal_col {
@@ -1377,13 +1221,13 @@ impl TimelineView {
             }
         }
         if l.state == LaneState::Eol {
-            if let Some(c) = l.end.and_then(|e| self.col(day(e) + self.scale)) {
+            if let Some(c) = l.end.and_then(|e| self.vp.col(day(e) + self.vp.scale)) {
                 if c < reveal_col {
                     buf[(c, marker_y)].set_char('┤').set_fg(FAINT);
                     if h >= 2 && self.info >= 1 {
                         put(
                             buf,
-                            self.plot,
+                            self.vp.plot,
                             c + 1,
                             marker_y,
                             "EOL",
@@ -1395,22 +1239,23 @@ impl TimelineView {
         }
 
         // A lane entirely out of view points to where it is.
-        let (vis_lo, vis_hi) = self.visible_days();
+        let (vis_lo, vis_hi) = self.vp.visible_days();
         if let (Some(a), Some(b)) = (l.first_date(), l.last_date()) {
             let style = Style::default().fg(GHOST);
             if day(b) < vis_lo {
                 put(
                     buf,
-                    self.plot,
-                    self.plot.x,
+                    self.vp.plot,
+                    self.vp.plot.x,
                     marker_y,
                     &format!("◂ {b}"),
                     style,
                 );
             } else if day(a) > vis_hi {
                 let text = format!("{a} ▸");
-                let x = (self.plot.x + self.plot.width).saturating_sub(text.chars().count() as u16);
-                put(buf, self.plot, x, marker_y, &text, style);
+                let x = (self.vp.plot.x + self.vp.plot.width)
+                    .saturating_sub(text.chars().count() as u16);
+                put(buf, self.vp.plot, x, marker_y, &text, style);
             }
         }
 
@@ -1425,7 +1270,9 @@ impl TimelineView {
                 let Ok(d) = NaiveDate::parse_from_str(v, "%Y%m%d") else {
                     continue;
                 };
-                let Some(c) = self.col(day(d)) else { continue };
+                let Some(c) = self.vp.col(day(d)) else {
+                    continue;
+                };
                 if c >= reveal_col {
                     continue;
                 }
@@ -1440,7 +1287,7 @@ impl TimelineView {
                 if h >= 2 && self.info >= 1 {
                     put(
                         buf,
-                        self.plot,
+                        self.vp.plot,
                         c,
                         label_y,
                         v,
@@ -1498,7 +1345,7 @@ impl TimelineView {
             .iter()
             .filter_map(|r| {
                 let n = badges_of(r).chars().count() as u16;
-                let c = self.col(day(r.date))?;
+                let c = self.vp.col(day(r.date))?;
                 (n > 0).then(|| (c, c + n - 1))
             })
             .collect();
@@ -1506,7 +1353,7 @@ impl TimelineView {
         let mut occupied: Vec<(u16, u16)> = Vec::new();
         for (_, i) in order {
             let r = &l.releases[i];
-            let Some(c) = self.col(day(r.date)) else {
+            let Some(c) = self.vp.col(day(r.date)) else {
                 continue;
             };
             if c >= reveal_col {
@@ -1529,13 +1376,13 @@ impl TimelineView {
                         '↺' => GATED,
                         _ => MUTED,
                     };
-                    if bx < self.plot.x + self.plot.width {
+                    if bx < self.vp.plot.x + self.vp.plot.width {
                         buf[(bx, label_y)].set_char(ch).set_fg(color);
                         bx += 1;
                     }
                 }
                 let important = marks.any() || r.kind == ReleaseKind::Mainline;
-                if self.info >= 1 && (important || self.scale < 2.5) {
+                if self.info >= 1 && (important || self.vp.scale < 2.5) {
                     let text = short_version(&r.version, &l.series);
                     let x0 = if bx > c { bx } else { c };
                     let x1 = x0 + text.chars().count() as u16;
@@ -1544,7 +1391,7 @@ impl TimelineView {
                         .any(|(a, b)| *a != c && x0 <= *b && *a <= x1);
                     if !occupied.iter().any(|(a, b)| x0 <= *b && *a <= x1)
                         && !hits_badge
-                        && x1 < self.plot.x + self.plot.width
+                        && x1 < self.vp.plot.x + self.vp.plot.width
                     {
                         let st = if marks.running || marks.current {
                             Style::default().fg(WHITE).add_modifier(Modifier::BOLD)
@@ -1555,7 +1402,7 @@ impl TimelineView {
                         } else {
                             Style::default().fg(MUTED)
                         };
-                        put(buf, self.plot, x0, label_y, &text, st);
+                        put(buf, self.vp.plot, x0, label_y, &text, st);
                         occupied.push((x0.saturating_sub(1), x1));
                     }
                 }
@@ -1592,7 +1439,7 @@ impl TimelineView {
 
         // Projections: hollow, grey, and labelled as expectations.
         for p in &l.projections {
-            let Some(c) = self.col(day(p.date)) else {
+            let Some(c) = self.vp.col(day(p.date)) else {
                 continue;
             };
             if c >= reveal_col {
@@ -1611,7 +1458,7 @@ impl TimelineView {
                 if !occupied.iter().any(|(a, b)| c <= *b && *a <= x1) {
                     put(
                         buf,
-                        self.plot,
+                        self.vp.plot,
                         c,
                         label_y,
                         &text,
@@ -1622,8 +1469,8 @@ impl TimelineView {
             }
             // The uncertainty, at the richer levels.
             if self.info >= 2 && h >= 3 {
-                let lo = self.col(day(p.date) - p.spread_days as f64);
-                let hi = self.col(day(p.date) + p.spread_days as f64);
+                let lo = self.vp.col(day(p.date) - p.spread_days as f64);
+                let hi = self.vp.col(day(p.date) + p.spread_days as f64);
                 if let (Some(a), Some(b)) = (lo, hi) {
                     for x in a..=b {
                         let cell = &mut buf[(x, heat_y)];
@@ -1677,9 +1524,11 @@ impl TimelineView {
             } else {
                 ('▂', Color::Rgb(0x16, 0x65, 0x34))
             };
-            if let (Some(c0), Some(c1)) = (self.col(from).or(Some(self.plot.x)), self.col(to)) {
+            if let (Some(c0), Some(c1)) =
+                (self.vp.col(from).or(Some(self.vp.plot.x)), self.vp.col(to))
+            {
                 for c in c0..=c1 {
-                    if c >= reveal_col || c >= self.plot.x + self.plot.width {
+                    if c >= reveal_col || c >= self.vp.plot.x + self.vp.plot.width {
                         break;
                     }
                     let cell = &mut buf[(c, y)];
@@ -1689,7 +1538,7 @@ impl TimelineView {
                 }
             }
             if !b.clean {
-                if let Some(c) = self.col(to) {
+                if let Some(c) = self.vp.col(to) {
                     if c < reveal_col {
                         let color = if b.pstore_hits > 0 { WHITE } else { BAD };
                         buf[(c, y)]
@@ -1700,7 +1549,7 @@ impl TimelineView {
             }
         }
         if !s.boots {
-            for c in self.plot.x..self.plot.x + self.plot.width {
+            for c in self.vp.plot.x..self.vp.plot.x + self.vp.plot.width {
                 if c < reveal_col {
                     buf[(c, y)].set_char('·').set_fg(FAINT);
                 }
@@ -1722,7 +1571,7 @@ impl TimelineView {
                 .collect()
         };
         for (x, v, removed) in events {
-            let Some(c) = self.col(x) else { continue };
+            let Some(c) = self.vp.col(x) else { continue };
             if c >= reveal_col {
                 continue;
             }
@@ -1743,7 +1592,14 @@ impl TimelineView {
                 };
                 let x1 = c + text.chars().count() as u16;
                 if !occupied.iter().any(|(a, b)| c <= *b && *a <= x1) {
-                    put(buf, self.plot, c, y + 1, &text, Style::default().fg(color));
+                    put(
+                        buf,
+                        self.vp.plot,
+                        c,
+                        y + 1,
+                        &text,
+                        Style::default().fg(color),
+                    );
                     occupied.push((c, x1));
                 }
             }
@@ -1758,14 +1614,15 @@ impl TimelineView {
         (ch, style): (char, Style),
         reveal_col: u16,
     ) {
-        let (lo, hi) = self.visible_days();
+        let (lo, hi) = self.vp.visible_days();
         if to < lo || from > hi {
             return;
         }
-        let a = self.col(from.max(lo)).unwrap_or(self.plot.x);
+        let a = self.vp.col(from.max(lo)).unwrap_or(self.vp.plot.x);
         let b = self
+            .vp
             .col(to.min(hi))
-            .unwrap_or(self.plot.x + self.plot.width - 1);
+            .unwrap_or(self.vp.plot.x + self.vp.plot.width - 1);
         for c in a..=b {
             if c >= reveal_col {
                 break;
@@ -1775,12 +1632,12 @@ impl TimelineView {
     }
 
     fn draw_today(&self, buf: &mut Buffer, axis_y: u16, bottom: u16) {
-        let Some(c) = self.col(day(today())) else {
+        let Some(c) = self.vp.col(day(today())) else {
             return;
         };
         put(
             buf,
-            self.plot,
+            self.vp.plot,
             c.saturating_sub(3),
             axis_y,
             " today ",
@@ -1801,7 +1658,7 @@ impl TimelineView {
         let (Some(d), Some(x)) = (self.selected_date(), self.selected_x()) else {
             return;
         };
-        let Some(c) = self.col(x) else { return };
+        let Some(c) = self.vp.col(x) else { return };
         for y in axis_y + 2..bottom {
             buf[(c, y)].set_bg(CURSOR_BG);
         }
@@ -1811,12 +1668,10 @@ impl TimelineView {
             buf[(c, marker_y)].set_bg(ACCENT).set_fg(Color::Black);
         }
         let label = d.format(" %Y-%m-%d ").to_string();
-        let x = c
-            .saturating_sub(label.chars().count() as u16 / 2)
-            .max(self.plot.x);
-        put(
+        let x = c.saturating_sub(label.chars().count() as u16 / 2);
+        put_within(
             buf,
-            self.plot,
+            self.vp.plot,
             x,
             axis_y + 1,
             &label,
@@ -2193,29 +2048,6 @@ impl TimelineView {
     }
 }
 
-fn day_at(v: &TimelineView, column: u16) -> f64 {
-    let (lo, _) = v.visible_days();
-    lo + f64::from(column.saturating_sub(v.plot.x)) * v.scale
-}
-
-fn add_months(d: NaiveDate, n: u32) -> NaiveDate {
-    let total = d.year() * 12 + d.month0() as i32 + n as i32;
-    NaiveDate::from_ymd_opt(total / 12, (total % 12) as u32 + 1, 1).unwrap_or(d)
-}
-
-fn zoom_label(scale: f64) -> String {
-    let per10 = scale * 10.0;
-    if per10 < 14.0 {
-        format!("{:.0}d/10col", per10.max(1.0))
-    } else if per10 < 60.0 {
-        format!("{:.0}w/10col", per10 / 7.0)
-    } else if per10 < 700.0 {
-        format!("{:.0}mo/10col", per10 / 30.4)
-    } else {
-        format!("{:.0}y/10col", per10 / 365.0)
-    }
-}
-
 /// `7.2.6` in lane `7.2` reads as `.6` when space is short, but the full
 /// version is clearer, so it is kept unless it is a candidate.
 fn short_version(version: &str, series: &str) -> String {
@@ -2326,44 +2158,6 @@ fn chips(m: &VersionMarks) -> Vec<(String, Style)> {
         v.push(("not on this machine".into(), Style::default().fg(FAINT)));
     }
     v
-}
-
-/// Write `text` at (x, y), clipped to `clip`. Returns the column after it.
-fn put(buf: &mut Buffer, clip: Rect, x: u16, y: u16, text: &str, style: Style) -> u16 {
-    if y < clip.y || y >= clip.y + clip.height {
-        return x;
-    }
-    let mut cx = x;
-    for ch in text.chars() {
-        if cx >= clip.x + clip.width {
-            break;
-        }
-        if cx >= clip.x {
-            buf[(cx, y)].set_char(ch).set_style(style);
-        }
-        cx += 1;
-    }
-    cx
-}
-
-fn draw_box(buf: &mut Buffer, r: Rect, color: Color) {
-    if r.width < 2 || r.height < 2 {
-        return;
-    }
-    let st = Style::default().fg(color);
-    let (x1, y1) = (r.x + r.width - 1, r.y + r.height - 1);
-    for x in r.x..=x1 {
-        buf[(x, r.y)].set_char('─').set_style(st);
-        buf[(x, y1)].set_char('─').set_style(st);
-    }
-    for y in r.y..=y1 {
-        buf[(r.x, y)].set_char('│').set_style(st);
-        buf[(x1, y)].set_char('│').set_style(st);
-    }
-    buf[(r.x, r.y)].set_char('╭').set_style(st);
-    buf[(x1, r.y)].set_char('╮').set_style(st);
-    buf[(r.x, y1)].set_char('╰').set_style(st);
-    buf[(x1, y1)].set_char('╯').set_style(st);
 }
 
 #[cfg(test)]
@@ -2582,6 +2376,7 @@ mod tests {
                 version: "7.2.0".into(),
             });
             m.boots.push(crate::timeline::BootSpan {
+                boot_id: None,
                 start: t("2026-08-27T08:00:00Z"),
                 end: t("2026-08-27T15:00:00Z"),
                 clean: false,
@@ -2716,11 +2511,11 @@ mod tests {
         let mut v = view();
         render(&mut v);
         let sel = day(v.selected_date().unwrap());
-        let before = (sel - v.target_center) / v.target_scale;
+        let before = (sel - v.vp.target_center) / v.vp.target_scale;
         v.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
-        let after = (sel - v.target_center) / v.target_scale;
+        let after = (sel - v.vp.target_center) / v.vp.target_scale;
         assert!((before - after).abs() < 0.01, "{before} vs {after}");
-        assert!(v.target_scale < v.scale);
+        assert!(v.vp.target_scale < v.vp.scale);
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -2748,30 +2543,30 @@ mod tests {
             .iter()
             .find(|(_, h)| matches!(h, Hit::ZoomIn))
             .unwrap();
-        let before = v.target_scale;
+        let before = v.vp.target_scale;
         v.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             zoom_in.x,
             zoom_in.y,
         ));
-        assert!(v.target_scale < before);
+        assert!(v.vp.target_scale < before);
     }
 
     #[test]
     fn the_wheel_zooms_and_dragging_pans() {
         let mut v = view();
         render(&mut v);
-        let (x, y) = (v.plot.x + v.plot.width / 2, v.plot.y + 4);
-        let scale = v.target_scale;
+        let (x, y) = (v.vp.plot.x + v.vp.plot.width / 2, v.vp.plot.y + 4);
+        let scale = v.vp.target_scale;
         v.handle_mouse(mouse(MouseEventKind::ScrollUp, x, y));
-        assert!(v.target_scale < scale, "wheel up zooms in");
+        assert!(v.vp.target_scale < scale, "wheel up zooms in");
 
-        let center = v.target_center;
+        let center = v.vp.target_center;
         v.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
         v.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x - 10, y));
         v.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x - 10, y));
         assert!(
-            v.target_center > center,
+            v.vp.target_center > center,
             "dragging left moves later dates into view"
         );
     }

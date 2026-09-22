@@ -8,6 +8,8 @@
 //! back and re-reads the system. There is no long-lived privileged session, and
 //! nothing is escalated that you have not seen written out.
 
+pub mod boots;
+pub mod canvas;
 pub mod state;
 pub mod timeline;
 pub mod ui;
@@ -77,17 +79,28 @@ fn leave(terminal: &mut Tui) -> Result<()> {
 fn event_loop(terminal: &mut Tui, d: &mut Dashboard) -> Result<()> {
     loop {
         d.pump();
-        let animating = if d.tab == Tab::Lineage {
-            d.ensure_timeline();
-            match d.active_timeline() {
-                Some(tl) => {
-                    tl.step();
-                    tl.animating()
+        let animating = match d.tab {
+            Tab::Lineage => {
+                d.ensure_timeline();
+                match d.active_timeline() {
+                    Some(tl) => {
+                        tl.step();
+                        tl.animating()
+                    }
+                    None => false,
                 }
-                None => false,
             }
-        } else {
-            false
+            Tab::Boots => {
+                d.ensure_boots();
+                match &mut d.boots {
+                    Some(b) => {
+                        b.step();
+                        b.animating()
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
         };
 
         terminal.draw(|f| ui::draw(f, d))?;
@@ -155,6 +168,10 @@ fn handle_mouse(d: &mut Dashboard, m: MouseEvent) {
             tl.handle_mouse(m);
             let info = tl.info;
             d.info_level = info;
+        }
+    } else if d.tab == Tab::Boots {
+        if let Some(b) = &mut d.boots {
+            b.handle_mouse(m);
         }
     } else {
         match m.kind {
@@ -261,6 +278,12 @@ fn handle_key(terminal: &mut Tui, d: &mut Dashboard, key: KeyEvent) -> Result<()
             tl.handle_key(key);
             let info = tl.info;
             d.info_level = info;
+        }
+        return Ok(());
+    }
+    if d.tab == Tab::Boots {
+        if let Some(b) = &mut d.boots {
+            b.handle_key(key);
         }
         return Ok(());
     }

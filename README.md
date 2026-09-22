@@ -124,6 +124,13 @@ Read-only commands run unprivileged. Mutating ones need root and say so. The
 dashboard runs unprivileged and re-executes itself under `pkexec` or `sudo` for
 a single action, showing you the exact argv before it runs.
 
+Every `update` is recorded. A failed one — PackageKit holding the lock, a
+licence to accept, a dependency decision zypper will not make unattended — is
+announced once by the daily check with the reason and what to do, and the
+dashboard shows it until an update succeeds. So is a pending reboot: a newer
+kernel installed than the one running, or core libraries updated. Licences are
+not accepted unattended unless `[backend] auto_agree_licenses = true`.
+
 Every command that changes anything takes `--dry-run`, which needs no root: it
 evaluates, and prints what it would lock, install and pin.
 
@@ -212,6 +219,19 @@ outside your series rather than in it.
 
 A new series is announced as soon as it appears, even while a fix inside your
 series is still being applied.
+
+## Boot history
+
+The **Boots** tab (`3`) is this machine's own history. One lane per kernel,
+each boot a bar from start to end, and a `✘` where a boot stopped without
+shutting down. Above them, each kernel's record at a glance — hours, boots,
+unclean ends per 100 hours — with the worst in red; below them, what changed:
+kernels installed and removed, updates run, versions marked good.
+
+Select a boot and the card shows how it ended and the last lines its journal
+holds; after a freeze they are the only evidence there is. `n` and `N` jump
+between unclean ends, the view zooms from months down to half an hour a column,
+and `c` returns to this boot.
 
 ## Boot health
 

@@ -36,7 +36,18 @@ pub fn draw(f: &mut Frame, d: &mut Dashboard) {
 
     draw_header(f, chunks[0], d);
 
-    if d.tab == Tab::Lineage {
+    if d.tab == Tab::Boots {
+        d.list_area = Rect::default();
+        match &mut d.boots {
+            Some(b) => b.render(chunks[1], f.buffer_mut()),
+            None => f.render_widget(
+                Paragraph::new("reading the journal…")
+                    .style(Style::default().fg(MUTED))
+                    .block(bordered("Boots")),
+                chunks[1],
+            ),
+        }
+    } else if d.tab == Tab::Lineage {
         // The timeline is the whole canvas; j/k still switch what it shows.
         d.list_area = Rect::default();
         let name = d.selected_name().unwrap_or_default();
@@ -299,7 +310,7 @@ fn draw_detail(f: &mut Frame, area: Rect, d: &mut Dashboard) {
     let text = match d.tab {
         Tab::Overview => overview_text(d),
         Tab::Lineage => Text::default(),
-        Tab::Health => health_text(d),
+        Tab::Boots => Text::default(),
         Tab::Log => log_text(d),
     };
 
@@ -615,67 +626,6 @@ fn system_lines(d: &Dashboard) -> Vec<Line<'static>> {
     lines
 }
 
-fn health_text(d: &Dashboard) -> Text<'static> {
-    let Some(h) = &d.health else {
-        return Text::styled("no boot data", Style::default().fg(MUTED));
-    };
-    if let Some(reason) = &h.unavailable {
-        return Text::styled(reason.clone(), Style::default().fg(GATED));
-    }
-
-    let mut lines = vec![
-        Line::styled(
-            "evidence per kernel — sluice never marks a kernel good on its own",
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-        ),
-        Line::raw(""),
-    ];
-    if let Some(note) = &h.kernels_unknown {
-        lines.push(Line::styled(note.clone(), Style::default().fg(GATED)));
-        lines.push(Line::raw(""));
-    }
-
-    for k in h.by_kernel() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<22}", k.kernel),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                k.summary(),
-                Style::default().fg(if k.unclean_ends > 0 { GATED } else { GOOD }),
-            ),
-        ]));
-    }
-
-    let unclean = h.unclean();
-    if !unclean.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "boots that ended without a shutdown sequence",
-            Style::default().fg(GATED).add_modifier(Modifier::BOLD),
-        ));
-        for b in unclean {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(crate::health::local_window(b), Style::default().fg(MUTED)),
-                Span::raw("  "),
-                Span::raw(b.kernel.clone().unwrap_or_else(|| "unknown".into())),
-                if b.pstore_hits > 0 {
-                    Span::styled(
-                        format!("  {} pstore record(s)", b.pstore_hits),
-                        Style::default().fg(BAD),
-                    )
-                } else {
-                    Span::raw("")
-                },
-            ]));
-        }
-    }
-
-    Text::from(lines)
-}
-
 fn log_text(d: &Dashboard) -> Text<'static> {
     let mut lines = vec![Line::styled(
         "this session",
@@ -729,7 +679,7 @@ fn log_text(d: &Dashboard) -> Text<'static> {
 
 fn draw_footer(f: &mut Frame, area: Rect, d: &Dashboard) {
     let keys: &[(&str, &str)] = match d.modal {
-        Modal::None if d.tab == Tab::Lineage => &[
+        Modal::None if matches!(d.tab, Tab::Lineage | Tab::Boots) => &[
             ("j/k", "component"),
             ("tab", "pane"),
             ("r", "refresh"),

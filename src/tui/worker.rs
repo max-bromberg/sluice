@@ -24,6 +24,8 @@ pub enum Request {
         cfg: ComponentConfig,
         version: String,
     },
+    /// The last journal lines of one boot.
+    Tail { boot_id: String, journalctl: String },
 }
 
 pub enum Response {
@@ -35,6 +37,10 @@ pub enum Response {
         component: String,
         version: String,
         shape: Option<Shape>,
+    },
+    Tail {
+        boot_id: String,
+        lines: Vec<String>,
     },
 }
 
@@ -76,6 +82,13 @@ impl Worker {
                             ),
                             component,
                             version,
+                        },
+                        Request::Tail {
+                            boot_id,
+                            journalctl,
+                        } => Response::Tail {
+                            lines: super::boots::journal_tail(&journalctl, &boot_id, 40),
+                            boot_id,
                         },
                     };
                     if resp_tx.send(response).is_err() {

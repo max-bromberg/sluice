@@ -138,6 +138,8 @@ impl VersionMarks {
 /// One boot, for the machine lane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootSpan {
+    /// The journal's id for the boot, for reading its tail.
+    pub boot_id: Option<String>,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub clean: bool,

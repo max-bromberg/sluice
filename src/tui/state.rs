@@ -6,6 +6,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 
+use super::boots::{BootsView, Event};
 use super::timeline::{Source, TimelineView};
 use super::worker::{Request, Response, Worker};
 use crate::app::{App, Status};
@@ -18,18 +19,18 @@ use crate::timeline::Relevance;
 pub enum Tab {
     Overview,
     Lineage,
-    Health,
+    Boots,
     Log,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Overview, Tab::Lineage, Tab::Health, Tab::Log];
+    pub const ALL: [Tab; 4] = [Tab::Overview, Tab::Lineage, Tab::Boots, Tab::Log];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Overview => "Overview",
             Tab::Lineage => "Lineage",
-            Tab::Health => "Health",
+            Tab::Boots => "Boots",
             Tab::Log => "Log",
         }
     }
@@ -108,6 +109,8 @@ pub struct Dashboard {
     /// One timeline per component or bundle, built on first view and fed by
     /// the worker as upstream data arrives.
     pub timelines: BTreeMap<String, TimelineView>,
+    /// The boot history, built on first view.
+    pub boots: Option<BootsView>,
     pub worker: Worker,
     /// The info level carries over between timelines.
     pub info_level: u8,
@@ -141,6 +144,7 @@ impl Dashboard {
             status: None,
             health: None,
             timelines: BTreeMap::new(),
+            boots: None,
             worker,
             info_level: 1,
             list_area: Rect::default(),
@@ -184,6 +188,7 @@ impl Dashboard {
         }
         // What is installed may have changed; timelines are rebuilt on view.
         self.timelines.clear();
+        self.boots = None;
         let n = self.entries().len();
         self.selected = self.selected.min(n.saturating_sub(1));
     }
@@ -352,6 +357,76 @@ impl Dashboard {
         }
     }
 
+    /// The boot history, built from the kernel component's view of this
+    /// machine, sluice's own update runs and what was marked good.
+    pub fn ensure_boots(&mut self) {
+        if self.boots.is_some() {
+            return;
+        }
+        let kernel = self
+            .app
+            .config
+            .components
+            .iter()
+            .find(|(_, c)| c.boot_entries)
+            .map(|(n, _)| n.clone());
+        let mut events: Vec<Event> = self
+            .app
+            .state
+            .update_runs
+            .iter()
+            .cloned()
+            .map(Event::Update)
+            .collect();
+        let (boots, records) = match kernel
+            .as_deref()
+            .and_then(|k| self.component_status(k).map(|c| c.eval.clone()))
+        {
+            Some(eval) => {
+                let cstate = self.app.state.component(&eval.component);
+                if let (Some(v), Some(at)) = (&cstate.known_good, cstate.known_good_marked_at) {
+                    events.push(Event::MarkedGood {
+                        at,
+                        version: v.to_string(),
+                    });
+                }
+                match self.app.machine_for(&eval, self.health.as_ref()) {
+                    Ok(m) => {
+                        events.extend(m.history.into_iter().map(Event::Change));
+                        (m.boots, m.records)
+                    }
+                    Err(e) => {
+                        self.note(format!("could not read this machine: {e:#}"));
+                        (Vec::new(), BTreeMap::new())
+                    }
+                }
+            }
+            // No kernel component: the journal alone.
+            None => {
+                let boots = self
+                    .health
+                    .as_ref()
+                    .map(|h| {
+                        h.boots
+                            .iter()
+                            .map(|b| crate::timeline::BootSpan {
+                                boot_id: Some(b.boot_id.clone()),
+                                start: b.start,
+                                end: b.end,
+                                clean: b.clean_end,
+                                kernel: b.kernel.clone(),
+                                kernel_inferred: b.kernel_inferred,
+                                pstore_hits: b.pstore_hits,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (boots, BTreeMap::new())
+            }
+        };
+        self.boots = Some(BootsView::new(boots, events, records));
+    }
+
     pub fn active_timeline(&mut self) -> Option<&mut TimelineView> {
         let name = self.selected_name()?;
         self.timelines.get_mut(&name)
@@ -382,7 +457,24 @@ impl Dashboard {
                         tl.set_shape(&component, &version, shape.clone());
                     }
                 }
+                Response::Tail { boot_id, lines } => {
+                    if let Some(b) = &mut self.boots {
+                        b.set_tail(&boot_id, lines);
+                    }
+                }
             }
+        }
+        if self.tab == Tab::Boots {
+            if let Some(b) = &mut self.boots {
+                if let Some(id) = b.wanted_tail() {
+                    b.mark_tail_loading(&id);
+                    let _ = self.worker.requests.send(Request::Tail {
+                        boot_id: id,
+                        journalctl: self.app.config.health.journalctl.clone(),
+                    });
+                }
+            }
+            return;
         }
         if self.tab != Tab::Lineage {
             return;

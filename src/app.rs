@@ -1636,6 +1636,7 @@ impl App {
                     .boots
                     .iter()
                     .map(|b| BootSpan {
+                        boot_id: Some(b.boot_id.clone()),
                         start: b.start,
                         end: b.end,
                         clean: b.clean_end,
