@@ -318,6 +318,29 @@ impl Default for HealthConfig {
     }
 }
 
+/// Where sluice's own releases come from. sluice never replaces itself: it
+/// announces a new release, and `sluice self-update` installs it on request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SelfUpdateConfig {
+    /// `owner/name` of the GitHub repository publishing releases.
+    pub repo: String,
+    /// Look for new releases in `status`, `check` and the dashboard.
+    pub check: bool,
+    /// Overrides the release API URL (a mirror, or testing).
+    pub api_url: Option<String>,
+}
+
+impl Default for SelfUpdateConfig {
+    fn default() -> Self {
+        Self {
+            repo: "max-bromberg/sluice".into(),
+            check: true,
+            api_url: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
@@ -364,6 +387,7 @@ pub struct Config {
     pub backend: BackendConfig,
     pub lineage: LineageConfig,
     pub notify: NotifyConfig,
+    pub self_update: SelfUpdateConfig,
     #[serde(rename = "component")]
     pub components: BTreeMap<String, ComponentConfig>,
     #[serde(rename = "bundle")]

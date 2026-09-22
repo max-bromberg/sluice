@@ -172,6 +172,9 @@ fn attention(d: &Dashboard) -> Vec<(String, Color)> {
     if let Some(esp) = status.esp.as_ref().filter(|_| status.esp_low) {
         out.push((format!("⚠ ESP {} MB free", esp.free_mb), GATED));
     }
+    if let Some(r) = &status.new_release {
+        out.push((format!("⬆ sluice {} — U", r.version()), AUTO));
+    }
     let unprotected: Vec<&str> = status
         .components
         .iter()
@@ -845,6 +848,7 @@ fn draw_help(f: &mut Frame) {
         ("p", "promote — cross the series gate (explicit)"),
         ("m", "mark good — vault and pin the installed version"),
         ("b", "roll back — boot the known-good version again"),
+        ("U", "update sluice itself, when a release is out"),
         ("", ""),
         ("pgup/pgdn", "scroll the detail pane"),
         ("q / ctrl-c", "quit"),

@@ -146,6 +146,8 @@ pub struct State {
     /// Versions sluice itself added to `multiversion.kernels`. Only these are
     /// ever unpinned; an explicit version you added by hand is left alone.
     pub pinned: Vec<Evr>,
+    /// The newest sluice release already announced, so `check` says it once.
+    pub announced_release: Option<String>,
 }
 
 impl Default for State {
@@ -157,6 +159,7 @@ impl Default for State {
             last_update: None,
             last_check: None,
             pinned: Vec::new(),
+            announced_release: None,
         }
     }
 }

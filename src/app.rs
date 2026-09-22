@@ -43,6 +43,8 @@ pub struct Status {
     pub health: HealthReport,
     pub vault_bytes: u64,
     pub warnings: Vec<String>,
+    /// A newer sluice release, if one is out.
+    pub new_release: Option<crate::selfupdate::Release>,
 }
 
 pub struct ComponentStatus {
@@ -349,6 +351,11 @@ impl App {
             health,
             vault_bytes: vault::size_bytes(&self.config.paths.vault_dir),
             warnings,
+            new_release: crate::selfupdate::available(
+                &self.config.self_update,
+                &self.config.lineage,
+                &self.config.paths.cache_dir,
+            ),
         })
     }
 
@@ -1842,6 +1849,23 @@ impl App {
             alerts.push((Urgency::Warning, msg));
         }
 
+        // A new sluice is announced once, like a gated series.
+        let mut announce_release = None;
+        if let Some(r) = &status.new_release {
+            let already = self.state.announced_release.as_deref() == Some(r.version());
+            if force || !already {
+                alerts.push((
+                    Urgency::Info,
+                    format!(
+                        "sluice {} is available (this is {}); `sudo sluice self-update` installs it",
+                        r.version(),
+                        crate::selfupdate::CURRENT
+                    ),
+                ));
+                announce_release = Some(r.version().to_string());
+            }
+        }
+
         if status.esp_low {
             if let Some(esp) = &status.esp {
                 alerts.push((
@@ -1875,6 +1899,9 @@ impl App {
                 &Notification::new("sluice: updates need your attention", body, urgency),
             );
 
+            if let Some(v) = announce_release {
+                self.state.announced_release = Some(v);
+            }
             for (component, version) in announced {
                 let cstate = self.state.component_mut(&component);
                 if let Some(g) = &mut cstate.gated {

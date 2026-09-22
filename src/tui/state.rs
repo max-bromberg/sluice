@@ -408,6 +408,9 @@ impl Dashboard {
 
     /// Build the confirmation for a mutating action on the current selection.
     pub fn plan(&mut self, verb: Verb) -> Option<PendingAction> {
+        if verb == Verb::SelfUpdate {
+            return self.plan_self_update();
+        }
         let mut action = if let Some(bundle) = self.selected_bundle() {
             self.plan_bundle(verb, &bundle)
         } else {
@@ -504,11 +507,59 @@ impl Dashboard {
         (out, blocked)
     }
 
+    /// Updating sluice itself: what is out, what it says, and how to go back.
+    fn plan_self_update(&self) -> Option<PendingAction> {
+        let current = crate::selfupdate::CURRENT;
+        let Some(release) = self.status.as_ref().and_then(|s| s.new_release.clone()) else {
+            let mut a = self.action(
+                Verb::SelfUpdate,
+                "sluice",
+                Vec::new(),
+                format!("sluice {current} is the latest release."),
+            )?;
+            a.blocked = true;
+            a.details = vec![(Tone::Faint, "nothing to update".into())];
+            return Some(a);
+        };
+        let mut a = self.action(
+            Verb::SelfUpdate,
+            "sluice",
+            vec!["self-update".into(), "--yes".into()],
+            format!("Update sluice {current} → {}.", release.version()),
+        )?;
+        let mut details = Vec::new();
+        if let Some(when) = &release.published_at {
+            details.push((
+                Tone::Faint,
+                format!("released {}", when.split('T').next().unwrap_or(when)),
+            ));
+        }
+        for line in release.notes_excerpt(10) {
+            details.push((Tone::Plain, format!("  {line}")));
+        }
+        details.push((Tone::Plain, String::new()));
+        details.push((
+            Tone::Good,
+            "✔ checked against the release's SHA256SUMS before use".into(),
+        ));
+        details.push((
+            Tone::Good,
+            "✔ run once to confirm it works before it replaces anything".into(),
+        ));
+        details.push((
+            Tone::Good,
+            "✔ the current version is kept: `sluice self-update --rollback`".into(),
+        ));
+        a.details = details;
+        Some(a)
+    }
+
     fn plan_component(&self, verb: Verb) -> Option<PendingAction> {
         let component = self.selected_name()?;
         let c = self.selected_component()?;
 
         let (args, consequence) = match verb {
+            Verb::SelfUpdate => return self.plan_self_update(),
             Verb::Update => (
                 vec!["update".to_string()],
                 "Refresh, apply every update your policies allow, and report anything gated. \
@@ -581,6 +632,7 @@ impl Dashboard {
         let members = self.app.config.bundles.get(bundle)?.components.clone();
         let list = members.join(", ");
         let (args, consequence) = match verb {
+            Verb::SelfUpdate => return self.plan_self_update(),
             Verb::Update => (
                 vec!["update".to_string()],
                 "Refresh, apply every update your policies allow, and report anything gated.".to_string(),
@@ -623,6 +675,7 @@ pub enum Verb {
     Promote,
     MarkGood,
     Rollback,
+    SelfUpdate,
 }
 
 impl Verb {
@@ -632,6 +685,7 @@ impl Verb {
             Verb::Promote => "promote",
             Verb::MarkGood => "mark good",
             Verb::Rollback => "roll back",
+            Verb::SelfUpdate => "update sluice",
         }
     }
 }

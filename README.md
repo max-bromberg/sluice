@@ -80,6 +80,25 @@ configuration, state and vault unless given `--purge`.
 To install a particular release: `SLUICE_VERSION=v0.1.0` before `sh`. To
 install from source: `cargo build --release && ./target/release/sluice setup`.
 
+## Updating sluice itself
+
+sluice holds itself to the rule it enforces: nothing changes without your
+say-so. It never replaces itself. When a new release is out, the daily check
+tells you once, `sluice status` mentions it, and the dashboard shows it in the
+header.
+
+```sh
+sudo sluice self-update            # shows the release notes, asks, installs
+sluice self-update --check         # only says whether one is out
+sudo sluice self-update --rollback # puts the previous version back
+```
+
+The download is checked against the release's published SHA-256 sums, the new
+binary is run once to confirm it starts and reports the right version before it
+replaces anything, and the version it replaces is kept for `--rollback`. `U` in
+the dashboard does the same, with the same preview first. Set
+`[self_update] check = false` to stop looking.
+
 ## Use
 
 Bare `sluice` opens the dashboard. Everything it does is also a subcommand, so

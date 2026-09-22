@@ -505,7 +505,7 @@ impl<'a> Fetcher<'a> {
                 Some(body)
             }
             Err(e) => {
-                self.warnings.push(format!("fetching {url}: {e}"));
+                self.warnings.push(format!("fetching {url}: {e:#}"));
                 // Any cache at all, however stale, is better than nothing here.
                 self.read_cached(url).map(|env| {
                     self.note_cache_hit(env.fetched_at);

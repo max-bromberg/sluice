@@ -249,6 +249,10 @@ fn handle_key(terminal: &mut Tui, d: &mut Dashboard, key: KeyEvent) -> Result<()
             propose(d, Verb::Rollback);
             return Ok(());
         }
+        KeyCode::Char('U') => {
+            propose(d, Verb::SelfUpdate);
+            return Ok(());
+        }
         _ => {}
     }
 

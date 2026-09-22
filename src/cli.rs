@@ -120,6 +120,21 @@ pub enum Command {
         #[arg(long, hide = true, value_name = "PLAN")]
         apply: Option<PathBuf>,
     },
+    /// Install a newer sluice, verified, keeping the current one to go back to.
+    SelfUpdate {
+        /// Only say whether a newer release is out (exit 1 if so).
+        #[arg(long, conflicts_with = "rollback")]
+        check: bool,
+        /// Put back the version that was replaced.
+        #[arg(long)]
+        rollback: bool,
+        /// Do not ask before installing.
+        #[arg(long, short)]
+        yes: bool,
+        /// Run by the new binary after it is installed.
+        #[arg(long, hide = true)]
+        post_install: bool,
+    },
     /// Undo what setup did: timers, locks, the installed binary.
     Uninstall {
         /// Also remove configuration, state, cache and the vault.
@@ -139,7 +154,7 @@ impl Command {
                 | Command::Rollback { .. }
                 | Command::Migrate { .. }
                 | Command::Repair
-        )
+        ) || matches!(self, Command::SelfUpdate { check: false, .. })
     }
 
     pub fn name(&self) -> &'static str {
@@ -158,6 +173,7 @@ impl Command {
             Command::ShowConfig => "show-config",
             Command::Setup { .. } => "setup",
             Command::Uninstall { .. } => "uninstall",
+            Command::SelfUpdate { .. } => "self-update",
         }
     }
 }
@@ -337,6 +353,16 @@ pub fn render_status(s: &Status, style: Style) -> String {
 
     for w in &s.warnings {
         out.push_str(&format!("{}\n", style.dim(&format!("note: {w}"))));
+    }
+    if let Some(r) = &s.new_release {
+        out.push_str(&format!(
+            "{}\n",
+            style.cyan(&format!(
+                "sluice {} is available (this is {}) — `sudo sluice self-update`",
+                r.version(),
+                crate::selfupdate::CURRENT
+            ))
+        ));
     }
 
     out
@@ -847,6 +873,13 @@ pub fn run(cli: Cli) -> Result<i32> {
             print!("{}", render_migrate(&report, style));
         }
 
+        Command::SelfUpdate {
+            check,
+            rollback,
+            yes,
+            post_install,
+        } => return self_update(&app, style, check, rollback, yes, post_install),
+
         Command::Repair => {
             let notes = app.repair(now)?;
             if notes.is_empty() {
@@ -858,6 +891,121 @@ pub fn run(cli: Cli) -> Result<i32> {
         }
     }
 
+    Ok(0)
+}
+
+fn self_update(
+    app: &App,
+    style: Style,
+    check: bool,
+    rollback: bool,
+    yes: bool,
+    post_install: bool,
+) -> Result<i32> {
+    use crate::selfupdate::{self as su, CURRENT};
+    let previous = su::previous_path(&app.config.paths.state_dir);
+
+    if post_install {
+        // The new binary brings its own systemd units; refresh any installed.
+        let installed: Vec<&str> = crate::setup::UNITS
+            .iter()
+            .map(|(n, _)| *n)
+            .filter(|n| {
+                std::path::Path::new(crate::setup::UNIT_DIR)
+                    .join(n)
+                    .exists()
+            })
+            .collect();
+        for (name, text) in crate::setup::UNITS {
+            if installed.contains(name) {
+                std::fs::write(
+                    std::path::Path::new(crate::setup::UNIT_DIR).join(name),
+                    text,
+                )?;
+            }
+        }
+        if !installed.is_empty() {
+            let _ = std::process::Command::new("systemctl")
+                .arg("daemon-reload")
+                .status();
+            println!("  {} refreshed the systemd units", style.green("✔"));
+        }
+        return Ok(0);
+    }
+
+    if rollback {
+        let target = su::target_binary()?;
+        let version = su::rollback(&target, &previous)?;
+        println!(
+            "{} {version} is back at {}",
+            style.green("rolled back:"),
+            target.display()
+        );
+        return Ok(0);
+    }
+
+    let release = su::latest(
+        &app.config.self_update,
+        &app.config.lineage,
+        &app.config.paths.cache_dir,
+    )?;
+    if !release.is_newer_than(CURRENT) {
+        println!(
+            "{}",
+            style.dim(&format!("sluice {CURRENT} is the latest release"))
+        );
+        return Ok(0);
+    }
+
+    println!(
+        "{}",
+        style.bold(&format!("sluice {CURRENT} → {}", release.version()))
+    );
+    if let Some(when) = release.published_at.as_deref() {
+        println!(
+            "  {}",
+            style.dim(&format!(
+                "released {}",
+                when.split('T').next().unwrap_or(when)
+            ))
+        );
+    }
+    for line in release.notes_excerpt(8) {
+        println!("  {}", style.dim(&line));
+    }
+    if !release.html_url.is_empty() {
+        println!("  {}", style.dim(&release.html_url));
+    }
+    if check {
+        println!("`sudo sluice self-update` installs it.");
+        return Ok(1);
+    }
+
+    let target = su::target_binary()?;
+    println!();
+    println!("This will download it, check it against the release's SHA256SUMS, run it");
+    println!(
+        "once to confirm it works, then replace {}.",
+        target.display()
+    );
+    println!("The current version is kept: `sudo sluice self-update --rollback` puts it back.");
+    if !yes && !confirm("Install it?")? {
+        println!("{}", style.dim("nothing was changed"));
+        return Ok(1);
+    }
+
+    let bytes = su::fetch_verified(&release)?;
+    println!("  {} downloaded and verified", style.green("✔"));
+    su::install(&bytes, release.version(), &target, &previous)?;
+    println!(
+        "  {} installed sluice {} at {}",
+        style.green("✔"),
+        release.version(),
+        target.display()
+    );
+    let _ = std::process::Command::new(&target)
+        .args(["self-update", "--post-install"])
+        .status();
     Ok(0)
 }
 
