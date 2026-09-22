@@ -37,6 +37,7 @@ pub mod lineage;
 pub mod notify;
 pub mod policy;
 pub mod privilege;
+pub mod setup;
 pub mod state;
 pub mod timeline;
 pub mod tui;

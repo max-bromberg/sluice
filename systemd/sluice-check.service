@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/sluice check
+ExecStart=/usr/local/bin/sluice check
 # `check` exits 1 when something needs attention. That is information, not a
 # failure, so the unit must not be marked failed for it.
 SuccessExitStatus=0 1

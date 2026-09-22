@@ -8,7 +8,7 @@ Conflicts=zypp-refresh.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/sluice update
+ExecStart=/usr/local/bin/sluice update
 TimeoutStartSec=2h
 
 # update installs packages, so it deliberately gets far fewer restrictions than

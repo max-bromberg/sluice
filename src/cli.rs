@@ -111,6 +111,21 @@ pub enum Command {
     Repair,
     /// Print the effective configuration, including defaults.
     ShowConfig,
+    /// First-time setup: install, configure for this machine, adopt locks.
+    Setup {
+        /// Accept every default without asking.
+        #[arg(long, short)]
+        yes: bool,
+        /// Carry out a plan (used by setup itself, under sudo).
+        #[arg(long, hide = true, value_name = "PLAN")]
+        apply: Option<PathBuf>,
+    },
+    /// Undo what setup did: timers, locks, the installed binary.
+    Uninstall {
+        /// Also remove configuration, state, cache and the vault.
+        #[arg(long)]
+        purge: bool,
+    },
 }
 
 impl Command {
@@ -141,6 +156,8 @@ impl Command {
             Command::Migrate { .. } => "migrate",
             Command::Repair => "repair",
             Command::ShowConfig => "show-config",
+            Command::Setup { .. } => "setup",
+            Command::Uninstall { .. } => "uninstall",
         }
     }
 }
@@ -581,11 +598,23 @@ pub fn render_migrate(r: &MigrateReport, style: Style) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn run(cli: Cli) -> Result<i32> {
+    let style = Style::detect(cli.no_color);
+    // Setup and uninstall run before (and without) a configuration.
+    match &cli.command {
+        Some(Command::Setup { yes, apply }) => {
+            return match apply {
+                Some(plan) => crate::setup::apply(plan, style).map(|_| 0),
+                None => crate::setup::run(*yes, style),
+            };
+        }
+        Some(Command::Uninstall { purge }) => return crate::setup::uninstall(*purge, style),
+        _ => {}
+    }
+
     let mut config = Config::discover(cli.config.as_deref())?;
     if cli.offline {
         config.lineage.offline = true;
     }
-    let style = Style::detect(cli.no_color);
     let now = Utc::now();
 
     let command = cli.command.unwrap_or(Command::Tui);
@@ -608,7 +637,9 @@ pub fn run(cli: Cli) -> Result<i32> {
     let mut app = App::new(config, cli.dry_run)?;
 
     match command {
-        Command::Tui | Command::ShowConfig => unreachable!("handled above"),
+        Command::Tui | Command::ShowConfig | Command::Setup { .. } | Command::Uninstall { .. } => {
+            unreachable!("handled above")
+        }
 
         Command::Status => {
             let status = app.status(now)?;

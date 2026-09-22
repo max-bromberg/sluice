@@ -382,30 +382,7 @@ impl Relevance {
     pub fn detect() -> Self {
         let proc_modules = std::fs::read_to_string("/proc/modules").unwrap_or_default();
         let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
-        let mut bound: BTreeSet<String> = BTreeSet::new();
-        for bus in [
-            "pci", "usb", "platform", "hid", "i2c", "virtio", "nvme", "scsi",
-        ] {
-            let Ok(drivers) = std::fs::read_dir(format!("/sys/bus/{bus}/drivers")) else {
-                continue;
-            };
-            for drv in drivers.flatten() {
-                let path = drv.path();
-                let has_device = std::fs::read_dir(&path).is_ok_and(|entries| {
-                    entries
-                        .flatten()
-                        .any(|e| e.file_name().to_string_lossy().contains(':'))
-                });
-                if !has_device {
-                    continue;
-                }
-                if let Ok(module) = std::fs::read_link(path.join("module")) {
-                    if let Some(name) = module.file_name() {
-                        bound.insert(name.to_string_lossy().into_owned());
-                    }
-                }
-            }
-        }
+        let bound = bound_modules();
         // Only filesystems on a real device; /proc/mounts also lists bpf,
         // cgroup2, tracefs and friends.
         let filesystems = mounts.lines().filter_map(|l| {
@@ -627,6 +604,36 @@ impl Relevance {
     pub fn tier_of(&self, module: &str) -> Option<Tier> {
         self.tokens.get(module).map(|(_, t)| *t)
     }
+}
+
+/// Kernel modules whose drivers are bound to a device on this machine, read
+/// from sysfs: the machine's actual hardware.
+pub fn bound_modules() -> BTreeSet<String> {
+    let mut bound: BTreeSet<String> = BTreeSet::new();
+    for bus in [
+        "pci", "usb", "platform", "hid", "i2c", "virtio", "nvme", "scsi",
+    ] {
+        let Ok(drivers) = std::fs::read_dir(format!("/sys/bus/{bus}/drivers")) else {
+            continue;
+        };
+        for drv in drivers.flatten() {
+            let path = drv.path();
+            let has_device = std::fs::read_dir(&path).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains(':'))
+            });
+            if !has_device {
+                continue;
+            }
+            if let Ok(module) = std::fs::read_link(path.join("module")) {
+                if let Some(name) = module.file_name() {
+                    bound.insert(name.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    bound
 }
 
 /// Shape a kernel.org ChangeLog, which is `git log` output of the stable

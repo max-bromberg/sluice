@@ -51,14 +51,34 @@ system. Treat it as something to read and try with `--dry-run` first.
 ## Install
 
 ```sh
-cargo install --path .
-sudo install -Dm644 config/sluice.example.toml /etc/sluice/config.toml
-sudo install -Dm644 systemd/sluice-check.{service,timer} -t /etc/systemd/system/
-sudo systemctl enable --now sluice-check.timer
+curl -fsSL https://raw.githubusercontent.com/max-bromberg/sluice/main/install.sh | sh
 ```
 
-`sluice-update.timer` also ships, deliberately **not** enabled. An unattended
-update is a policy choice, not a default.
+The installer downloads the static binary for your CPU from the latest
+release, checks it against the published SHA-256 sums, and starts
+`sluice setup`. The script itself installs nothing.
+
+Setup looks at the machine — kernel flavour and versions, a manual kernel lock,
+the GPU and its Mesa and firmware packages, the ESP, how each kernel has behaved
+here — and asks a handful of questions, each with a default. It then shows the
+whole plan, asks for your password once, and:
+
+- installs `sluice` to `/usr/local/bin`
+- writes `/etc/sluice/config.toml`, fitted to this machine and commented
+- stores a webhook URL root-only, if you gave one
+- installs and starts the daily check (and the weekly update, if you asked)
+- takes over a manual kernel lock, with the fallback kernel you chose
+- records the install history and which kernel each boot ran
+
+Its suggestion for the fallback kernel comes from this machine's own record: a
+kernel known to have frozen it is never the default choice.
+
+Run `sluice setup` again at any time to update or reconfigure.
+`sudo sluice uninstall` undoes it — timers, locks, the binary — keeping the
+configuration, state and vault unless given `--purge`.
+
+To install a particular release: `SLUICE_VERSION=v0.1.0` before `sh`. To
+install from source: `cargo build --release && ./target/release/sluice setup`.
 
 ## Use
 
@@ -317,6 +337,18 @@ addresses, home paths, network identifiers, webhook tokens and keys anywhere in
 the tree, and non-noreply commit identities. Terms specific to one person or
 machine go in a git-ignored `local/privacy-denylist`, so they are checked for
 without ever being published.
+
+## Releasing
+
+```sh
+scripts/release.sh 0.2.0
+```
+
+That sets the version, tags `v0.2.0` and pushes it. The Release workflow then
+tests, builds static binaries for x86_64 and aarch64, runs the x86_64 one and
+the installer against it, and publishes the release with `SHA256SUMS` and
+`install.sh`. Running the workflow by hand from the Actions tab does all of
+that except publishing.
 
 ## Licence
 
