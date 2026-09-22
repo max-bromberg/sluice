@@ -51,7 +51,12 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 
 asset="sluice-$arch-linux"
 say "Downloading sluice ($version, $arch)…"
-fetch "$base/$asset" "$tmp/sluice" || die "could not download $base/$asset"
+if ! fetch "$base/$asset" "$tmp/sluice"; then
+    if [ -z "${SLUICE_BASE_URL:-}" ]; then
+        die "could not download $asset ($version). If no release has been published yet, see https://github.com/$repo/releases"
+    fi
+    die "could not download $base/$asset"
+fi
 fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || die "could not download the checksums"
 
 expected="$(awk -v f="$asset" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS")"
