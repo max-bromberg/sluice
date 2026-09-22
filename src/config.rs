@@ -287,6 +287,8 @@ pub struct HealthConfig {
     /// Directory systemd-pstore archives crash dumps into. Absence of this
     /// directory is normal and is never treated as an error.
     pub pstore_dir: PathBuf,
+    /// zypp's transaction log, read (with root) for install history.
+    pub zypp_history: PathBuf,
     /// A boot whose journal tail matches any of these ended cleanly. The
     /// defaults are the systemd shutdown sequence; override them if your init
     /// logs something else.
@@ -303,6 +305,7 @@ impl Default for HealthConfig {
         Self {
             journalctl: "journalctl".into(),
             pstore_dir: "/var/lib/systemd/pstore".into(),
+            zypp_history: "/var/log/zypp/history".into(),
             clean_end_patterns: vec![
                 r"systemd-shutdown\[1\]:".into(),
                 r"Reached target (Shutdown|Power-Off|Power Off|Reboot|Halt|Final Step)".into(),

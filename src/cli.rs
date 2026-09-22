@@ -477,6 +477,53 @@ pub fn render_lineage(v: &LineageView, style: Style) -> String {
     out
 }
 
+pub fn render_promote_preview(previews: &[crate::app::PromotePreview], style: Style) -> String {
+    let mut out = String::new();
+    for p in previews {
+        let head = match (&p.from, &p.to) {
+            (Some(f), Some(t)) => format!("{}  {f} → {t}", p.component),
+            (None, Some(t)) => format!("{}  → {t}", p.component),
+            _ => format!("{}  (stays)", p.component),
+        };
+        out.push_str(&format!("{}\n", style.bold(&head)));
+        for b in &p.blockers {
+            out.push_str(&format!("  {}\n", style.red(&format!("✖ {b}"))));
+        }
+        if p.to.is_none() {
+            continue;
+        }
+        if !p.packages.is_empty() {
+            out.push_str(&format!("  installs {}\n", p.packages.join(", ")));
+        }
+        if let Some(kg) = &p.known_good {
+            out.push_str(&format!(
+                "  {}\n",
+                if p.known_good_vaulted {
+                    style.green(&format!("✔ rollback target {kg}, vaulted"))
+                } else {
+                    style.yellow(&format!("rollback target {kg} is NOT vaulted"))
+                }
+            ));
+        }
+        let now = if p.gate_now.is_empty() {
+            "no lock".to_string()
+        } else {
+            p.gate_now.join(", ")
+        };
+        let after = if p.gate_after.is_empty() {
+            "no lock".to_string()
+        } else {
+            p.gate_after.join(", ")
+        };
+        out.push_str(&format!("  gate  {now}  →  {after}\n"));
+        for n in &p.notes {
+            out.push_str(&format!("  {}\n", style.dim(n)));
+        }
+    }
+    out.push('\n');
+    out
+}
+
 pub fn render_check(r: &CheckReport, style: Style) -> String {
     let mut out = String::new();
     if r.alerts.is_empty() {
@@ -600,6 +647,20 @@ pub fn run(cli: Cli) -> Result<i32> {
                 }
             }
 
+            let previews = app.promote_preview(&members, now)?;
+            print!("{}", render_promote_preview(&previews, style));
+            let moving = previews.iter().any(|p| p.to.is_some());
+            let fatal = previews
+                .iter()
+                .any(|p| !p.blockers.is_empty() && (p.to.is_some() || previews.len() == 1));
+            if !moving || fatal {
+                println!(
+                    "{}",
+                    style.red("cannot promote until the ✖ above is dealt with")
+                );
+                return Ok(1);
+            }
+
             let what = if bundle {
                 format!("Promote the {component} bundle ({})", members.join(", "))
             } else {
@@ -704,7 +765,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         }
 
         Command::Health { kernel } => {
-            let report = crate::health::report(&app.config.health, &mut app.runner)?;
+            let report = app.health_report()?;
             if let Some(reason) = &report.unavailable {
                 println!("{}", style.yellow(reason));
                 return Ok(1);

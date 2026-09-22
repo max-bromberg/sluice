@@ -717,36 +717,76 @@ fn draw_footer(f: &mut Frame, area: Rect, d: &Dashboard) {
 }
 
 fn draw_confirm(f: &mut Frame, action: &super::state::PendingAction) {
-    let area = centered(70, 40, f.area());
+    use super::state::Tone;
+    let tall = !action.details.is_empty();
+    let area = centered(76, if tall { 80 } else { 40 }, f.area());
     f.render_widget(Clear, area);
 
-    let lines = vec![
+    let mut lines = vec![
         Line::styled(
             action.consequence.clone(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
-        Line::styled(
+    ];
+    for (tone, text) in &action.details {
+        let style = match tone {
+            Tone::Heading => Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            Tone::Plain => Style::default(),
+            Tone::Good => Style::default().fg(GOOD),
+            Tone::Warn => Style::default().fg(GATED),
+            Tone::Bad => Style::default().fg(BAD).add_modifier(Modifier::BOLD),
+            Tone::Faint => Style::default().fg(MUTED),
+        };
+        lines.push(Line::styled(text.clone(), style));
+    }
+    if tall {
+        lines.push(Line::raw(""));
+    }
+    if action.blocked {
+        lines.push(Line::styled(
+            "this cannot go ahead until the ✖ above is dealt with",
+            Style::default().fg(BAD).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        lines.push(Line::styled(
             "this will run, with privileges:",
             Style::default().fg(MUTED),
-        ),
-        Line::styled(action.command_line.clone(), Style::default().fg(AUTO)),
-        Line::raw(""),
-        Line::styled(
+        ));
+        lines.push(Line::styled(
+            action.command_line.clone(),
+            Style::default().fg(AUTO),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
             "the terminal is handed over so the password prompt works normally",
             Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-        ),
-    ];
+        ));
+    }
 
+    let color = if action.blocked { BAD } else { GATED };
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(GATED))
+                .border_style(Style::default().fg(color))
                 .title(Span::styled(
                     format!(" {} ", action.title),
-                    Style::default().fg(GATED).add_modifier(Modifier::BOLD),
-                )),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ))
+                .title_bottom(
+                    Line::from(Span::styled(
+                        if action.blocked {
+                            " esc close "
+                        } else {
+                            " y go ahead · n cancel "
+                        },
+                        Style::default().fg(MUTED),
+                    ))
+                    .alignment(Alignment::Center),
+                ),
         ),
         area,
     );

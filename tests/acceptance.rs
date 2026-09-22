@@ -634,3 +634,57 @@ fn lineage_can_show_the_distribution_changelog() {
         "an unreachable upstream is reported, not fatal"
     );
 }
+
+/// The promotion preview says what would happen, and what stands in the way,
+/// without changing anything.
+#[test]
+fn promote_preview_shows_the_move_and_its_safety_net() {
+    let f = Fixture::new();
+    let backend = std::rc::Rc::new(f.tumbleweed_on_7_2());
+    let mut app = App::new(f.config.clone(), false)
+        .unwrap()
+        .with_backend(Box::new(std::rc::Rc::clone(&backend)));
+    app.update(now()).unwrap();
+    tumbleweed_jumps_to_7_3(&backend);
+
+    let kernel = vec!["kernel".to_string()];
+    let blocked = app.promote_preview(&kernel, now()).unwrap();
+    assert!(
+        blocked[0]
+            .blockers
+            .iter()
+            .any(|b| b.contains("no known-good")),
+        "{:?}",
+        blocked[0].blockers
+    );
+
+    // Pretend the repository still carries 7.2.6 for a moment, so it can be
+    // marked good (and vaulted) after the fact.
+    backend.packages.borrow_mut().iter_mut().for_each(|p| {
+        if p.evr.to_string() == "7.2.6-1.1" {
+            p.repo = "repo-oss".into();
+        }
+    });
+    app.mark_good("kernel", None, now()).unwrap();
+    let installs_before = backend.installs.borrow().len();
+
+    let preview = &app.promote_preview(&kernel, now()).unwrap()[0];
+    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+    assert_eq!(preview.to.as_ref().unwrap().to_string(), "7.3.3-1.1");
+    assert!(preview
+        .packages
+        .iter()
+        .any(|p| p.starts_with("kernel-default-7.3.3")));
+    assert!(preview.known_good_vaulted);
+    assert!(preview
+        .gate_now
+        .contains(&"kernel-default >= 7.3".to_string()));
+    assert!(preview
+        .gate_after
+        .contains(&"kernel-default >= 7.4".to_string()));
+    assert_eq!(
+        backend.installs.borrow().len(),
+        installs_before,
+        "a preview installs nothing"
+    );
+}

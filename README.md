@@ -114,6 +114,25 @@ wheel. `[` and `]` (or the buttons) choose how much to show: at the top level
 each release carries a bar for how much changed, coloured by how much of that
 touches this machine, and the card below lists the changes that do.
 
+Your own history is on it too. Every version this machine has installed and
+removed appears on the machine row (`▼` `▽`), a kernel you once had shows `◍`,
+and scrubbing to a kernel lights up the boots that ran it. Each kernel's card
+carries its record here — boots, hours, unclean ends, and unclean ends per
+100 hours so short and long stints compare fairly — and a `⚠` marks kernels
+that have ended a boot uncleanly.
+
+A `↺` marks a release whose changes to this machine's drivers were reverted in
+a later release of the series — a regression upstream noticed and backed out.
+Reverts are matched to what they undo by commit id (stable backports carry
+their upstream id) or by subject, across the series you are on and the ones
+waiting for you.
+
+`p` on the timeline (or anywhere) opens a promotion preview before anything
+runs: the packages, the rollback target and whether it is vaulted, the gate
+before and after, the boot default, what the release did to your drivers and
+whether any of it has since been reverted — and anything that blocks it.
+`sluice promote` prints the same preview.
+
 "This machine" is worked out, not configured: the drivers actually bound to its
 devices (read from sysfs), the modules they rely on, and its mounted
 filesystems. A fix to `amdgpu`, `mt7925` or `btrfs` counts; a fix to another
@@ -183,6 +202,14 @@ sluice never marks a kernel good on this. The evidence informs your decision.
 
 `check` reports each unclean end once — boots that ended since the last check —
 rather than the whole history every day.
+
+Which kernel a boot ran is only in the kernel's own journal messages, and the
+install history only in zypp's root-only log. Runs with root — the `check`
+timer, `update`, `sudo sluice health` — record both in `evidence.json` in the
+state directory, and accumulate boot records as the journal rotates. Without
+them, a boot is attributed by inference (the newest installed kernel is what
+sdbootutil boots) only where that is certain, and always marked as inferred;
+older boots stay "unknown" rather than being pinned on the wrong kernel.
 
 ## Rollback actually works
 

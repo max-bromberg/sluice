@@ -175,7 +175,7 @@ fn handle_key(terminal: &mut Tui, d: &mut Dashboard, key: KeyEvent) -> Result<()
     match d.modal.clone() {
         Modal::Confirm(action) => {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                KeyCode::Char('y') | KeyCode::Char('Y') if !action.blocked => {
                     d.modal = Modal::None;
                     run_privileged(terminal, d, &action)?;
                 }

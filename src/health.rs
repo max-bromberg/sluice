@@ -28,6 +28,10 @@ pub struct BootRecord {
     pub end: DateTime<Utc>,
     /// `None` when the boot's kernel messages are no longer retained.
     pub kernel: Option<String>,
+    /// The kernel was inferred from install history rather than named by the
+    /// boot's own journal; see [`crate::evidence::attribute`].
+    #[serde(default)]
+    pub kernel_inferred: bool,
     pub clean_end: bool,
     /// Crash-dump records archived within this boot's window.
     pub pstore_hits: usize,
@@ -51,6 +55,9 @@ pub struct KernelHealth {
     pub uptime_hours: f64,
     pub unclean_ends: usize,
     pub pstore_hits: usize,
+    /// Boots attributed to this kernel by inference, not by their journal.
+    #[serde(default)]
+    pub inferred: usize,
 }
 
 impl KernelHealth {
@@ -66,6 +73,14 @@ impl KernelHealth {
         );
         if self.pstore_hits > 0 {
             s.push_str(&format!(", {} pstore record(s)", self.pstore_hits));
+        }
+        if self.inferred > 0 {
+            let which = if self.inferred == self.boots {
+                "kernel"
+            } else {
+                "some kernels"
+            };
+            s.push_str(&format!(" ({which} inferred from install history)"));
         }
         s
     }
@@ -106,6 +121,7 @@ impl HealthReport {
                 e.unclean_ends += 1;
             }
             e.pstore_hits += b.pstore_hits;
+            e.inferred += usize::from(b.kernel_inferred);
         }
         let mut out: Vec<_> = map.into_values().collect();
         out.sort_by(|a, b| b.uptime_hours.total_cmp(&a.uptime_hours));
@@ -176,6 +192,7 @@ pub fn report(cfg: &HealthConfig, r: &mut Runner) -> Result<HealthReport> {
             } else {
                 None
             },
+            kernel_inferred: false,
             clean_end,
             pstore_hits: pstore.iter().filter(|t| **t >= start && **t <= end).count(),
         });
@@ -186,8 +203,9 @@ pub fn report(cfg: &HealthConfig, r: &mut Runner) -> Result<HealthReport> {
         boots,
         unavailable: None,
         kernels_unknown: (!kernels_readable).then(|| {
-            "kernel messages are not readable, so boots cannot be attributed to a kernel; \
-             run as root or join the systemd-journal group"
+            "kernel messages are not readable without root or the systemd-journal group; \
+             boots are attributed from what root runs recorded, or inferred from install history \
+             where that is certain"
                 .to_string()
         }),
     })
@@ -363,6 +381,7 @@ pipewire[2105]: spa.alsa: hw:1: snd_pcm_avail after recover: Broken pipe";
             start,
             end: start + Duration::hours(hours),
             kernel: Some(kernel.into()),
+            kernel_inferred: false,
             clean_end: clean,
             pstore_hits: 0,
         }

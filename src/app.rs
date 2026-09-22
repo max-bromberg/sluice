@@ -63,12 +63,16 @@ pub struct ComponentStatus {
 impl ComponentStatus {
     /// The single line that says what needs attention, if anything.
     pub fn headline(&self) -> String {
-        match &self.eval.decision {
-            Decision::UpToDate if self.eval.series_withdrawn => {
+        Self::headline_of(&self.eval)
+    }
+
+    pub fn headline_of(eval: &Evaluation) -> String {
+        match &eval.decision {
+            Decision::UpToDate if eval.series_withdrawn => {
                 "up to date, but this series is no longer shipped".into()
             }
             Decision::UpToDate => "up to date".into(),
-            Decision::Apply { target } => match self.eval.gated_series() {
+            Decision::Apply { target } => match eval.gated_series() {
                 Some((series, _)) => format!("will update to {target}; {series} is gated"),
                 None => format!("will update to {target}"),
             },
@@ -257,7 +261,7 @@ impl App {
         let mut warnings = Vec::new();
         let evals = self.evaluate(now)?;
 
-        let health = health::report(&self.config.health, &mut self.runner)?;
+        let health = self.health_report()?;
         if let Some(reason) = health
             .unavailable
             .as_ref()
@@ -432,6 +436,13 @@ impl App {
         // still a problem worth naming.
         report.notes.extend(self.verify_retention()?);
         report.notes.extend(self.enforce_boot_defaults(now)?);
+        // A run with root is the chance to record install history and which
+        // kernel each boot ran, for the unprivileged views to use later.
+        if let Err(e) = self.health_report() {
+            report
+                .notes
+                .push(format!("boot evidence not recorded: {e:#}"));
+        }
         self.state.last_update = Some(now);
         self.save()?;
         Ok(report)
@@ -743,6 +754,109 @@ impl App {
             first.notes.extend(notes);
         }
         Ok(reports)
+    }
+
+    /// What promoting would do, without doing any of it: the packages, the
+    /// rollback target, how the gate moves, and anything that stands in the
+    /// way. One entry per component (a bundle has several).
+    pub fn promote_preview(
+        &mut self,
+        members: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<PromotePreview>> {
+        let locks = self.backend.locks(&mut self.runner).unwrap_or_default();
+        let mut out = Vec::new();
+        for component in members {
+            let (cfg, eval) = self.eval_of(component, now)?;
+            let cstate = self.state.component(component);
+            let mut p = PromotePreview {
+                component: component.clone(),
+                from: eval.installed.clone(),
+                known_good: cstate.known_good.clone(),
+                known_good_vaulted: cstate
+                    .known_good
+                    .as_ref()
+                    .is_some_and(|v| cstate.is_vaulted(v)),
+                gate_now: locks
+                    .iter()
+                    .filter(|l| owns(l, &eval))
+                    .map(LockSpec::spec_string)
+                    .collect(),
+                ..Default::default()
+            };
+
+            let target = match (eval.gated.clone(), &eval.decision) {
+                (Some((series, target)), _) => {
+                    p.series = Some(series);
+                    Some(target)
+                }
+                (None, Decision::Held { target }) if eval.held_at.is_some() => Some(target.clone()),
+                _ => None,
+            };
+            let Some(target) = target else {
+                p.blockers.push(format!(
+                    "nothing is gated for {component}: {}",
+                    ComponentStatus::headline_of(&eval)
+                ));
+                out.push(p);
+                continue;
+            };
+            p.to = Some(target.clone());
+
+            match &p.known_good {
+                None => p.blockers.push(format!(
+                    "no known-good version of {component} is recorded, so there would be nothing to roll back to — mark one good first"
+                )),
+                Some(kg) if !p.known_good_vaulted => p.blockers.push(format!(
+                    "the known-good {kg} is not vaulted, so it could not be reinstalled once the repository drops it"
+                )),
+                _ => {}
+            }
+
+            let packages = self.family_at_target(&cfg, &eval, &target)?;
+            if packages.is_empty() {
+                p.blockers.push(format!(
+                    "the repositories offer no packages for {component} {target}"
+                ));
+            }
+            p.packages = packages.iter().map(Pkg::nevra).collect();
+
+            // The gate after: held at the series after the new one, or — out
+            // of a rollback hold — whatever the policy normally asks for.
+            let names: Vec<String> = {
+                let mut n: Vec<String> = eval
+                    .family
+                    .iter()
+                    .filter(|x| !policy::is_kmp(&x.name))
+                    .map(|x| x.name.clone())
+                    .collect();
+                n.extend(cfg.anchor.clone());
+                n.sort();
+                n.dedup();
+                n
+            };
+            p.gate_after = match p.series.as_deref().and_then(gate::next_series) {
+                Some(next) if cfg.policy == Policy::HoldSeries => names
+                    .iter()
+                    .map(|n| gate::series_lock(n, &next, component).spec_string())
+                    .collect(),
+                _ => Vec::new(),
+            };
+
+            if cfg.boot_entries {
+                p.notes.push(format!(
+                    "{target} becomes the default boot entry; the previous kernels stay installed"
+                ));
+            }
+            if let Some(kg) = &p.known_good {
+                p.notes.push(format!(
+                    "if it misbehaves: `sluice rollback {component}` boots {kg} again and puts {} back behind the gate",
+                    target
+                ));
+            }
+            out.push(p);
+        }
+        Ok(out)
     }
 
     /// Mark every member of a bundle good at its installed version.
@@ -1067,7 +1181,8 @@ impl App {
 
         // Boot evidence is informational here; a missing journal must not
         // block marking a version good.
-        let health = health::report(&self.config.health, &mut self.runner)
+        let health = self
+            .health_report()
             .ok()
             .and_then(|h| match_kernel_health(&h, &version));
 
@@ -1234,6 +1349,74 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // evidence
+    // -----------------------------------------------------------------------
+
+    /// The packages whose history is worth keeping: every component's anchor.
+    fn tracked_names(&self) -> std::collections::BTreeSet<String> {
+        self.config
+            .components
+            .values()
+            .filter_map(|c| c.anchor.clone())
+            .collect()
+    }
+
+    /// What root runs have recorded, refreshed from zypp's history log when
+    /// this process can read it.
+    pub fn evidence(&self) -> crate::evidence::Evidence {
+        let mut e = crate::evidence::Evidence::load(&self.config.paths.state_dir);
+        if let Ok(text) = std::fs::read_to_string(&self.config.health.zypp_history) {
+            e.history = crate::evidence::parse_zypp_history(&text, &self.tracked_names());
+        }
+        e
+    }
+
+    /// The boot-health report with every boot attributed to a kernel: named
+    /// by its journal, recorded by an earlier root run, or inferred from the
+    /// install history. A run with root also records what it saw.
+    pub fn health_report(&mut self) -> Result<HealthReport> {
+        let mut report = health::report(&self.config.health, &mut self.runner)?;
+        let mut evidence = self.evidence();
+
+        if crate::privilege::is_root() && !self.runner.dry_run() {
+            let history = std::fs::read_to_string(&self.config.health.zypp_history)
+                .ok()
+                .map(|t| crate::evidence::parse_zypp_history(&t, &self.tracked_names()));
+            evidence.merge(history, &report, Utc::now());
+            if let Err(e) = evidence.save(&self.config.paths.state_dir) {
+                self.runner.note(&format!("could not save evidence: {e:#}"));
+            }
+        }
+
+        // Boots are attributed to the kernel component, if there is one.
+        let kernel = self
+            .config
+            .components
+            .iter()
+            .find(|(_, c)| c.boot_entries)
+            .map(|(n, c)| (n.clone(), c.clone()));
+        if let Some((_, cfg)) = kernel {
+            if let Some(anchor) = cfg.anchor.clone() {
+                let installed_now: Vec<(Evr, Option<DateTime<Utc>>)> = self
+                    .backend
+                    .installed_details(&mut self.runner, std::slice::from_ref(&anchor))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| (p.evr, p.installed_at))
+                    .collect();
+                crate::evidence::attribute(
+                    &mut report,
+                    &evidence,
+                    &anchor,
+                    self.running_kernel.as_deref(),
+                    &installed_now,
+                );
+            }
+        }
+        Ok(report)
+    }
+
+    // -----------------------------------------------------------------------
     // timeline
     // -----------------------------------------------------------------------
 
@@ -1332,6 +1515,31 @@ impl App {
             set(&v.version, |x| x.vaulted = true);
         }
 
+        // What was installed and removed, and when.
+        if let Some(anchor) = &anchor {
+            let evidence = self.evidence();
+            for e in evidence.history.iter().filter(|e| &e.name == anchor) {
+                let version = normalize(&e.evr.version);
+                let removed = e.action == crate::evidence::Action::Remove;
+                m.history.push(crate::timeline::Change {
+                    at: e.at,
+                    removed,
+                    version: version.clone(),
+                });
+                let marks = m.marks.entry(version).or_default();
+                if removed {
+                    marks.removed_at = Some(e.at.date_naive());
+                } else if marks.installed_at.is_none() {
+                    marks.installed_at = Some(e.at.date_naive());
+                }
+            }
+            // Removed and then reinstalled is simply installed.
+            for marks in m.marks.values_mut().filter(|x| x.installed) {
+                marks.removed_at = None;
+            }
+            m.history.sort_by_key(|c| c.at);
+        }
+
         if cfg.boot_entries {
             if let Some(h) = health {
                 m.boots = h
@@ -1342,8 +1550,13 @@ impl App {
                         end: b.end,
                         clean: b.clean_end,
                         kernel: b.kernel.clone(),
+                        kernel_inferred: b.kernel_inferred,
                         pstore_hits: b.pstore_hits,
                     })
+                    .collect();
+                m.records = crate::evidence::per_version(&h.boots)
+                    .into_iter()
+                    .map(|(v, r)| (normalize(&v), r))
                     .collect();
             }
         }
@@ -2024,6 +2237,24 @@ pub struct PromoteReport {
     pub to: Evr,
     pub series: String,
     pub packages: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+/// See [`App::promote_preview`].
+#[derive(Debug, Clone, Default)]
+pub struct PromotePreview {
+    pub component: String,
+    pub from: Option<Evr>,
+    pub to: Option<Evr>,
+    /// The new series, when crossing a gate (not when releasing a hold).
+    pub series: Option<String>,
+    pub packages: Vec<String>,
+    pub known_good: Option<Evr>,
+    pub known_good_vaulted: bool,
+    pub gate_now: Vec<String>,
+    pub gate_after: Vec<String>,
+    /// Reasons it cannot go ahead.
+    pub blockers: Vec<String>,
     pub notes: Vec<String>,
 }
 

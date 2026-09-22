@@ -56,6 +56,20 @@ pub struct PendingAction {
     /// The exact argv, shown before it runs — nothing is escalated invisibly.
     pub args: Vec<String>,
     pub command_line: String,
+    /// A preview of what will happen, line by line.
+    pub details: Vec<(Tone, String)>,
+    /// Something stands in the way; the action cannot be confirmed.
+    pub blocked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Heading,
+    Plain,
+    Good,
+    Warn,
+    Bad,
+    Faint,
 }
 
 /// What the dashboard is currently showing over the main view.
@@ -164,7 +178,7 @@ impl Dashboard {
             }
             Err(e) => self.note(format!("status failed: {e:#}")),
         }
-        match crate::health::report(&self.app.config.health, &mut self.app.runner) {
+        match self.app.health_report() {
             Ok(h) => self.health = Some(h),
             Err(e) => self.note(format!("health unavailable: {e:#}")),
         }
@@ -393,10 +407,104 @@ impl Dashboard {
     }
 
     /// Build the confirmation for a mutating action on the current selection.
-    pub fn plan(&self, verb: Verb) -> Option<PendingAction> {
-        if let Some(bundle) = self.selected_bundle() {
-            return self.plan_bundle(verb, &bundle);
+    pub fn plan(&mut self, verb: Verb) -> Option<PendingAction> {
+        let mut action = if let Some(bundle) = self.selected_bundle() {
+            self.plan_bundle(verb, &bundle)
+        } else {
+            self.plan_component(verb)
+        };
+        if verb == Verb::Promote {
+            let members: Vec<String> = match self.selected_entry()? {
+                Entry::Component(c) => vec![c],
+                Entry::Bundle(b) => self.app.config.bundles.get(&b)?.components.clone(),
+            };
+            let previews = match self.app.promote_preview(&members, Utc::now()) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.note(format!("could not preview the promotion: {e:#}"));
+                    return action;
+                }
+            };
+            let (details, blocked) = self.preview_details(&previews);
+            let name = self.selected_name()?;
+            let a = action.get_or_insert_with(|| PendingAction {
+                title: format!("promote {name}"),
+                consequence: "Nothing can be promoted right now.".into(),
+                args: Vec::new(),
+                command_line: String::new(),
+                details: Vec::new(),
+                blocked: true,
+            });
+            a.details = details;
+            a.blocked |= blocked;
         }
+        action
+    }
+
+    /// The preview, as lines: per component what moves, what protects it, how
+    /// the gate changes — plus, from the timeline if it is loaded, what the
+    /// target release changed on this machine's drivers.
+    fn preview_details(
+        &self,
+        previews: &[crate::app::PromotePreview],
+    ) -> (Vec<(Tone, String)>, bool) {
+        let mut out = Vec::new();
+        let mut blocked = previews.iter().all(|p| p.to.is_none());
+        for p in previews {
+            let head = match (&p.from, &p.to) {
+                (Some(f), Some(t)) => format!("{}  {f}  →  {t}", p.component),
+                (None, Some(t)) => format!("{}  →  {t}", p.component),
+                _ => format!("{}  (stays)", p.component),
+            };
+            out.push((Tone::Heading, head));
+            for b in &p.blockers {
+                // In a bundle, a member with nothing gated simply stays.
+                let fatal = p.to.is_some() || previews.len() == 1;
+                out.push((
+                    if fatal { Tone::Bad } else { Tone::Faint },
+                    format!("  ✖ {b}"),
+                ));
+                blocked |= fatal;
+            }
+            if p.to.is_none() {
+                continue;
+            }
+            if !p.packages.is_empty() {
+                out.push((Tone::Plain, format!("  installs {}", p.packages.join(", "))));
+            }
+            match (&p.known_good, p.known_good_vaulted) {
+                (Some(kg), true) => {
+                    out.push((Tone::Good, format!("  ✔ rollback target {kg}, vaulted")))
+                }
+                (Some(kg), false) => {
+                    out.push((Tone::Warn, format!("  rollback target {kg} is NOT vaulted")))
+                }
+                (None, _) => {}
+            }
+            let now = if p.gate_now.is_empty() {
+                "no lock".to_string()
+            } else {
+                p.gate_now.join(", ")
+            };
+            let after = if p.gate_after.is_empty() {
+                "no lock".to_string()
+            } else {
+                p.gate_after.join(", ")
+            };
+            out.push((Tone::Plain, format!("  gate  {now}  →  {after}")));
+            for n in &p.notes {
+                out.push((Tone::Faint, format!("  {n}")));
+            }
+            if let (Some(tl), Some(to)) = (self.timelines.get(&p.component), &p.to) {
+                for line in tl.release_notes(&p.component, &to.version) {
+                    out.push((Tone::Warn, format!("  {line}")));
+                }
+            }
+        }
+        (out, blocked)
+    }
+
+    fn plan_component(&self, verb: Verb) -> Option<PendingAction> {
         let component = self.selected_name()?;
         let c = self.selected_component()?;
 
@@ -464,6 +572,8 @@ impl Dashboard {
             consequence,
             args,
             command_line: cmd.display(),
+            details: Vec::new(),
+            blocked: false,
         })
     }
 

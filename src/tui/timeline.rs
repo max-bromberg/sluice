@@ -88,6 +88,11 @@ pub enum ItemRef {
         version: String,
         date: NaiveDate,
     },
+    Removal {
+        source: usize,
+        version: String,
+        date: NaiveDate,
+    },
     Boot {
         source: usize,
         index: usize,
@@ -328,23 +333,48 @@ impl TimelineView {
 
     fn machine_items(&self, source: usize) -> Vec<(NaiveDate, ItemRef)> {
         let s = &self.sources[source];
-        let mut items: Vec<(NaiveDate, ItemRef)> = s
-            .machine
-            .marks
-            .iter()
-            .filter_map(|(v, m)| {
-                m.installed_at.map(|d| {
-                    (
-                        d,
+        let mut items: Vec<(NaiveDate, ItemRef)> = if s.machine.history.is_empty() {
+            // No history log: what is installed now, and since when.
+            s.machine
+                .marks
+                .iter()
+                .filter_map(|(v, m)| {
+                    m.installed_at.map(|d| {
+                        (
+                            d,
+                            ItemRef::Install {
+                                source,
+                                version: v.clone(),
+                                date: d,
+                            },
+                        )
+                    })
+                })
+                .collect()
+        } else {
+            s.machine
+                .history
+                .iter()
+                .map(|c| {
+                    let date = c.at.date_naive();
+                    let version = c.version.clone();
+                    let item = if c.removed {
+                        ItemRef::Removal {
+                            source,
+                            version,
+                            date,
+                        }
+                    } else {
                         ItemRef::Install {
                             source,
-                            version: v.clone(),
-                            date: d,
-                        },
-                    )
+                            version,
+                            date,
+                        }
+                    };
+                    (date, item)
                 })
-            })
-            .collect();
+                .collect()
+        };
         items.extend(
             s.machine
                 .boots
@@ -639,6 +669,37 @@ impl TimelineView {
         true
     }
 
+    /// Lanes whose whole history is fetched, so reverts can be tracked: the
+    /// series this machine is on, and the ones waiting for it.
+    fn watched(&self, source: usize, lane: usize) -> bool {
+        let s = &self.sources[source];
+        let Some(l) = self.lane(source, lane) else {
+            return false;
+        };
+        s.machine.series.as_deref() == Some(l.series.as_str())
+            || l.state == LaneState::Development
+            || l.releases
+                .iter()
+                .any(|r| s.machine.marks_for(&r.version).gated)
+    }
+
+    /// Reverts matched to what they undo, across one lane.
+    pub fn watch(&self, source: usize, lane: usize) -> BTreeMap<String, crate::timeline::Watch> {
+        let s = &self.sources[source];
+        let Some(l) = self.lane(source, lane) else {
+            return BTreeMap::new();
+        };
+        let shaped: Vec<(&str, &Shape)> = l
+            .releases
+            .iter()
+            .filter_map(|r| match s.shapes.get(&r.version) {
+                Some(ShapeState::Ready(shape)) => Some((r.version.as_str(), shape)),
+                _ => None,
+            })
+            .collect();
+        crate::timeline::revert_watch(&shaped)
+    }
+
     /// Releases whose changes should be fetched now: the selection, and at
     /// the richer info levels everything visible in the selected lane.
     pub fn wanted_shapes(&self) -> Vec<(String, String)> {
@@ -665,6 +726,18 @@ impl TimelineView {
                 want(source, &r.version);
             }
         }
+        // Watched lanes are fetched whole, so reverts can be matched.
+        for row in &self.rows {
+            if let RowKind::Lane { source, lane } = *row {
+                if self.watched(source, lane) {
+                    if let Some(l) = self.lane(source, lane) {
+                        for r in l.releases.iter().filter(|r| r.kind == ReleaseKind::Point) {
+                            want(source, &r.version);
+                        }
+                    }
+                }
+            }
+        }
         if self.info >= 2 {
             if let Some(RowKind::Lane { source, lane }) = self.rows.get(self.row).copied() {
                 let (lo, hi) = self.visible_days();
@@ -677,6 +750,62 @@ impl TimelineView {
                         want(source, &r.version);
                     }
                 }
+            }
+        }
+        out
+    }
+
+    /// What this timeline knows about one release that a decision should
+    /// weigh: its record on this machine, and what it did to this machine's
+    /// drivers.
+    pub fn release_notes(&self, component: &str, version: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let Some(s) = self.sources.iter().find(|s| s.component == component) else {
+            return out;
+        };
+        let key = crate::timeline::normalize(version);
+        if let Some(rec) = s.machine.records.get(&key) {
+            out.push(format!("already run here: {}", rec.summary()));
+        }
+        let si = self
+            .sources
+            .iter()
+            .position(|x| x.component == component)
+            .unwrap_or(0);
+        if let Some(up) = &s.upstream {
+            for (li, l) in up.lanes.iter().enumerate() {
+                if !l.releases.iter().any(|r| r.version == version) {
+                    continue;
+                }
+                let watch = self.watch(si, li);
+                if let Some(w) = watch.get(version).filter(|w| !w.reverted_later.is_empty()) {
+                    out.push(format!(
+                        "↺ {} of this release's changes to your drivers were reverted later",
+                        w.reverted_later.len()
+                    ));
+                }
+                let series_total: usize = watch.values().map(|w| w.reverted_later.len()).sum();
+                if series_total > 0 {
+                    out.push(format!(
+                        "↺ across {} so far, {series_total} change(s) to your drivers have been reverted",
+                        if l.series.is_empty() { "its releases" } else { l.series.as_str() }
+                    ));
+                }
+            }
+        }
+        if let Some(ShapeState::Ready(shape)) = s.shapes.get(version) {
+            let hw: Vec<String> = shape
+                .relevant
+                .iter()
+                .filter(|(_, _, t)| *t == Tier::Hardware)
+                .take(5)
+                .map(|(d, n, _)| format!("{d} {n}"))
+                .collect();
+            if !hw.is_empty() {
+                out.push(format!(
+                    "changes to this machine's drivers: {}",
+                    hw.join(" · ")
+                ));
             }
         }
         out
@@ -856,7 +985,7 @@ impl TimelineView {
         }
 
         // A legend, so the glyphs can be learned by looking.
-        let legend: [(&str, &str, Style); 8] = [
+        let legend: [(&str, &str, Style); 10] = [
             ("▶", "running", Style::default().fg(AUTO)),
             ("●", "installed", Style::default().fg(GOOD)),
             ("★", "boots by default", Style::default().fg(STAR)),
@@ -865,6 +994,12 @@ impl TimelineView {
             ("◉", "offered", Style::default().fg(AUTO)),
             ("◌", "expected", Style::default().fg(GHOST)),
             ("✖", "unclean end", Style::default().fg(BAD)),
+            (
+                "◍",
+                "was installed",
+                Style::default().fg(mix(GOOD, FAINT, 0.45)),
+            ),
+            ("↺", "later reverted", Style::default().fg(GATED)),
         ];
         let mut lx = inner.x + 1;
         for (glyph, what, style) in legend {
@@ -893,10 +1028,10 @@ impl TimelineView {
             .unwrap_or(8)
             .clamp(8, 24);
         let card_h: u16 = match self.info {
-            0 => 4,
-            1 => 5,
-            2 => 7,
-            _ => 13,
+            0 => 5,
+            1 => 6,
+            2 => 8,
+            _ => 14,
         }
         .min(inner.height / 2);
         let lane_h: u16 = match self.info {
@@ -1264,6 +1399,8 @@ impl TimelineView {
             }
         }
 
+        let watch = self.watch(source, lane);
+
         // Markers, most important last so they win shared columns.
         let mut order: Vec<(u8, usize)> = l
             .releases
@@ -1272,6 +1409,49 @@ impl TimelineView {
             .map(|(i, r)| (priority(&s.machine.marks_for(&r.version), r), i))
             .collect();
         order.sort();
+
+        // Badges under each marker: what this machine does with it. Worked out
+        // first, so labels can be placed around every release's badges.
+        let badges_of = |r: &Release| -> String {
+            let marks = s.machine.marks_for(&r.version);
+            let mut b = String::new();
+            if marks.default_boot {
+                b.push('★');
+            }
+            if marks.known_good {
+                b.push('✔');
+            }
+            if marks.testing {
+                b.push('⚗');
+            }
+            if marks.vaulted && self.info >= 2 {
+                b.push('▣');
+            }
+            if s.machine
+                .records
+                .get(&crate::timeline::normalize(&r.version))
+                .is_some_and(|x| x.unclean > 0)
+            {
+                b.push('⚠');
+            }
+            if watch
+                .get(&r.version)
+                .is_some_and(|w| !w.reverted_later.is_empty())
+            {
+                b.push('↺');
+            }
+            b
+        };
+        let badge_cells: Vec<(u16, u16)> = l
+            .releases
+            .iter()
+            .filter_map(|r| {
+                let n = badges_of(r).chars().count() as u16;
+                let c = self.col(day(r.date))?;
+                (n > 0).then(|| (c, c + n - 1))
+            })
+            .collect();
+
         let mut occupied: Vec<(u16, u16)> = Vec::new();
         for (_, i) in order {
             let r = &l.releases[i];
@@ -1287,25 +1467,15 @@ impl TimelineView {
 
             // Badges under the marker: what this machine does with it.
             if h >= 2 {
-                let mut badges = String::new();
-                if marks.default_boot {
-                    badges.push('★');
-                }
-                if marks.known_good {
-                    badges.push('✔');
-                }
-                if marks.testing {
-                    badges.push('⚗');
-                }
-                if marks.vaulted && self.info >= 2 {
-                    badges.push('▣');
-                }
+                let badges = badges_of(r);
                 let mut bx = c;
                 for ch in badges.chars() {
                     let color = match ch {
                         '★' => STAR,
                         '✔' => GOOD,
                         '⚗' => AUTO,
+                        '⚠' => BAD,
+                        '↺' => GATED,
                         _ => MUTED,
                     };
                     if bx < self.plot.x + self.plot.width {
@@ -1318,7 +1488,11 @@ impl TimelineView {
                     let text = short_version(&r.version, &l.series);
                     let x0 = if bx > c { bx } else { c };
                     let x1 = x0 + text.chars().count() as u16;
+                    let hits_badge = badge_cells
+                        .iter()
+                        .any(|(a, b)| *a != c && x0 <= *b && *a <= x1);
                     if !occupied.iter().any(|(a, b)| x0 <= *b && *a <= x1)
+                        && !hits_badge
                         && x1 < self.plot.x + self.plot.width
                     {
                         let st = if marks.running || marks.current {
@@ -1413,10 +1587,45 @@ impl TimelineView {
 
     fn draw_machine(&self, buf: &mut Buffer, source: usize, y: u16, reveal_col: u16) {
         let s = &self.sources[source];
+        // Scrubbing a kernel lights up the boots that ran it.
+        let selected_version = match self.selected() {
+            Some(ItemRef::Release {
+                source: rs,
+                lane,
+                index,
+            }) if rs == source => self
+                .lane(rs, lane)
+                .and_then(|l| l.releases.get(index))
+                .map(|r| crate::timeline::normalize(&r.version)),
+            Some(ItemRef::Install {
+                source: rs,
+                version,
+                ..
+            })
+            | Some(ItemRef::Removal {
+                source: rs,
+                version,
+                ..
+            }) if rs == source => Some(version),
+            _ => None,
+        };
         // Boots as a strip: each boot a run of blocks, a freeze a red cross.
         for b in &s.machine.boots {
             let from = day(b.start.date_naive());
             let to = day(b.end.date_naive());
+            let lit = selected_version.is_some() && b.version() == selected_version;
+            let (ch, color) = if lit {
+                (
+                    '▅',
+                    if b.kernel_inferred {
+                        mix(AUTO, FAINT, 0.35)
+                    } else {
+                        AUTO
+                    },
+                )
+            } else {
+                ('▂', Color::Rgb(0x16, 0x65, 0x34))
+            };
             if let (Some(c0), Some(c1)) = (self.col(from).or(Some(self.plot.x)), self.col(to)) {
                 for c in c0..=c1 {
                     if c >= reveal_col || c >= self.plot.x + self.plot.width {
@@ -1424,7 +1633,7 @@ impl TimelineView {
                     }
                     let cell = &mut buf[(c, y)];
                     if cell.symbol() != "✖" {
-                        cell.set_char('▂').set_fg(Color::Rgb(0x16, 0x65, 0x34));
+                        cell.set_char(ch).set_fg(color);
                     }
                 }
             }
@@ -1446,22 +1655,44 @@ impl TimelineView {
                 }
             }
         }
-        // Installs: when each version arrived on this machine.
+        // Installs (▼) and removals (▽): when each version came and went.
         let mut occupied: Vec<(u16, u16)> = Vec::new();
-        for (v, m) in &s.machine.marks {
-            let Some(d) = m.installed_at else { continue };
+        let events: Vec<(NaiveDate, String, bool)> = if s.machine.history.is_empty() {
+            s.machine
+                .marks
+                .iter()
+                .filter_map(|(v, m)| m.installed_at.map(|d| (d, v.clone(), false)))
+                .collect()
+        } else {
+            s.machine
+                .history
+                .iter()
+                .map(|c| (c.at.date_naive(), c.version.clone(), c.removed))
+                .collect()
+        };
+        for (d, v, removed) in events {
             let Some(c) = self.col(day(d)) else { continue };
             if c >= reveal_col {
                 continue;
             }
-            buf[(c, y)]
-                .set_char('▼')
-                .set_fg(if m.running { AUTO } else { GOOD });
+            let m = s.machine.marks.get(&v).cloned().unwrap_or_default();
+            let (glyph, color) = if removed {
+                ('▽', mix(BAD, FAINT, 0.4))
+            } else if m.running {
+                ('▼', AUTO)
+            } else {
+                ('▼', GOOD)
+            };
+            buf[(c, y)].set_char(glyph).set_fg(color);
             if self.info >= 1 {
-                let text = v.clone();
+                let text = if removed {
+                    format!("−{v}")
+                } else {
+                    v.clone()
+                };
                 let x1 = c + text.chars().count() as u16;
                 if !occupied.iter().any(|(a, b)| c <= *b && *a <= x1) {
-                    put(buf, self.plot, c, y + 1, &text, Style::default().fg(GOOD));
+                    put(buf, self.plot, c, y + 1, &text, Style::default().fg(color));
                     occupied.push((c, x1));
                 }
             }
@@ -1626,6 +1857,74 @@ impl TimelineView {
                     }
                     lines.push(v);
                 }
+                // What happened to its changes afterwards.
+                if let Some(w) = self.watch(source, lane).get(&r.version) {
+                    if !w.reverted_later.is_empty() {
+                        let mut by: Vec<&str> =
+                            w.reverted_later.iter().map(|x| x.by.as_str()).collect();
+                        by.dedup();
+                        let mut drivers: Vec<&str> =
+                            w.reverted_later.iter().map(|x| x.driver.as_str()).collect();
+                        drivers.sort_unstable();
+                        drivers.dedup();
+                        lines.push(vec![(
+                            format!(
+                                "↺ {} of its changes to {} {} reverted later, in {}",
+                                w.reverted_later.len(),
+                                drivers.join(", "),
+                                if w.reverted_later.len() == 1 {
+                                    "was"
+                                } else {
+                                    "were"
+                                },
+                                by.join(", ")
+                            ),
+                            Style::default().fg(GATED).add_modifier(Modifier::BOLD),
+                        )]);
+                        if self.info >= 3 {
+                            for x in &w.reverted_later {
+                                lines.push(vec![
+                                    ("  ↺ ".into(), Style::default().fg(GATED)),
+                                    (x.subject.clone(), Style::default().fg(WHITE)),
+                                    (format!("  — reverted in {}", x.by), dim),
+                                ]);
+                            }
+                        }
+                    }
+                    if !w.reverts_earlier.is_empty() {
+                        let mut from: Vec<&str> =
+                            w.reverts_earlier.iter().map(|x| x.2.as_str()).collect();
+                        from.dedup();
+                        lines.push(vec![(
+                            format!(
+                                "reverts {} earlier change{} to this machine's drivers (from {})",
+                                w.reverts_earlier.len(),
+                                if w.reverts_earlier.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                },
+                                from.join(", ")
+                            ),
+                            Style::default().fg(MUTED),
+                        )]);
+                    }
+                }
+                // How this kernel has behaved on this machine.
+                if let Some(rec) = s
+                    .machine
+                    .records
+                    .get(&crate::timeline::normalize(&r.version))
+                {
+                    let color = if rec.unclean > 0 { BAD } else { GOOD };
+                    lines.push(vec![
+                        ("on this machine: ".into(), Style::default().fg(STAR)),
+                        (
+                            rec.summary(),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                    ]);
+                }
                 if self.info >= 2 {
                     match s.shapes.get(&r.version) {
                         Some(ShapeState::Ready(shape)) => {
@@ -1762,6 +2061,30 @@ impl TimelineView {
                 ]);
                 lines.push(chips(&m));
             }
+            Some(ItemRef::Removal {
+                source,
+                version,
+                date,
+            }) => {
+                let s = &self.sources[source];
+                lines.push(vec![
+                    ("▽ ".into(), Style::default().fg(BAD)),
+                    (
+                        format!("{} {version}", s.component),
+                        Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+                    ),
+                    (
+                        format!("   removed from this machine {date} · {}", when(date)),
+                        dim,
+                    ),
+                ]);
+                if let Some(rec) = s.machine.records.get(&version) {
+                    lines.push(vec![
+                        ("while it was here: ".into(), dim),
+                        (rec.summary(), Style::default().fg(WHITE)),
+                    ]);
+                }
+            }
             Some(ItemRef::Boot { source, index }) => {
                 let b = &self.sources[source].machine.boots[index];
                 let hours = (b.end - b.start).num_minutes() as f64 / 60.0;
@@ -1787,8 +2110,9 @@ impl TimelineView {
                 ]);
                 lines.push(vec![(
                     format!(
-                        "kernel {} · the journal ends without a shutdown sequence: a freeze, a crash or a power loss{}",
-                        b.kernel.as_deref().unwrap_or("unknown (needs root or the systemd-journal group)"),
+                        "kernel {}{} · the journal ends without a shutdown sequence: a freeze, a crash or a power loss{}",
+                        b.kernel.as_deref().unwrap_or("unknown (a root `sluice check` records it)"),
+                        if b.kernel_inferred { " (inferred from install history)" } else { "" },
                         if b.pstore_hits > 0 { format!(" · {} pstore crash record(s)", b.pstore_hits) } else { String::new() }
                     ),
                     dim,
@@ -1859,7 +2183,7 @@ fn priority(m: &VersionMarks, r: &Release) -> u8 {
         5
     } else if m.default_boot || m.known_good || m.testing {
         4
-    } else if m.installed {
+    } else if m.installed || m.removed_at.is_some() {
         3
     } else if r.kind == ReleaseKind::Mainline {
         2
@@ -1885,6 +2209,10 @@ fn release_glyph(r: &Release, m: &VersionMarks, mine: bool, elapsed: f64) -> (ch
     }
     if m.installed {
         return ('●', Style::default().fg(GOOD).add_modifier(Modifier::BOLD));
+    }
+    if m.removed_at.is_some() {
+        // Was here once.
+        return ('◍', Style::default().fg(mix(GOOD, FAINT, 0.45)));
     }
     if m.offered {
         // In the repositories and not installed: this is what update brings.
@@ -1933,6 +2261,10 @@ fn chips(m: &VersionMarks) -> Vec<(String, Style)> {
     }
     if m.vaulted {
         v.push(chip("▣ vaulted", MUTED));
+        v.push(gap());
+    }
+    if let (Some(r), false) = (m.removed_at, m.installed) {
+        v.push(chip(&format!("◍ removed {r}"), MUTED));
         v.push(gap());
     }
     if m.offered && !m.installed {
@@ -2082,6 +2414,101 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn history_and_freezes_show_on_the_timeline() {
+        let mut v = view();
+        {
+            let m = &mut v.sources[0].machine;
+            m.marks.insert(
+                "7.2.6".into(),
+                VersionMarks {
+                    removed_at: Some(d("2026-09-18")),
+                    offered: true,
+                    ..Default::default()
+                },
+            );
+            m.history.push(crate::timeline::Change {
+                at: "2026-09-18T10:00:00Z".parse().unwrap(),
+                removed: true,
+                version: "7.2.6".into(),
+            });
+            m.records.insert(
+                "7.2.0".into(),
+                crate::evidence::KernelRecord {
+                    boots: 9,
+                    hours: 427.0,
+                    unclean: 2,
+                    pstore: 0,
+                    inferred: 8,
+                },
+            );
+        }
+        v.sources[0].boots = true;
+        v.rebuild_rows();
+        let screen = render(&mut v);
+        assert!(
+            screen.contains('⚠'),
+            "a kernel with unclean ends is flagged:\n{screen}"
+        );
+        assert!(
+            screen.contains('▽'),
+            "the removal is on the machine row:\n{screen}"
+        );
+        assert!(
+            screen.contains("2 unclean ends"),
+            "the card carries the record:\n{screen}"
+        );
+        assert!(
+            screen.contains("inferred"),
+            "and says what was inferred:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_later_revert_is_flagged_on_the_release_it_undid() {
+        use crate::timeline::{ChangeRef, RevertRef, Tier};
+        let mut v = view();
+        let change = ChangeRef {
+            subject: "drm/amdgpu: enable the shiny thing".into(),
+            driver: "amdgpu".into(),
+            tier: Tier::Hardware,
+            ids: vec!["111111111111".into()],
+        };
+        v.set_shape(
+            "kernel",
+            "7.2.6",
+            Some(Shape {
+                patches: 10,
+                changes: vec![change],
+                ..Default::default()
+            }),
+        );
+        v.set_shape(
+            "kernel",
+            "7.2.7",
+            Some(Shape {
+                patches: 3,
+                reverts_of: vec![RevertRef {
+                    subject: "drm/amdgpu: enable the shiny thing".into(),
+                    ids: vec![],
+                }],
+                ..Default::default()
+            }),
+        );
+        v.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let screen = render(&mut v);
+        assert!(screen.contains('↺'), "the release is flagged:\n{screen}");
+        assert!(
+            screen.contains("reverted later, in 7.2.7"),
+            "and the card says so:\n{screen}"
+        );
+        let notes = v.release_notes("kernel", "7.2.6");
+        assert!(
+            notes.iter().any(|n| n.contains("reverted later")),
+            "{notes:?}"
+        );
     }
 
     #[test]

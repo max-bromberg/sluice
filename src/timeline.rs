@@ -125,6 +125,8 @@ pub struct VersionMarks {
     pub current: bool,
     /// Offered by the repositories right now.
     pub offered: bool,
+    /// Once installed here, since removed.
+    pub removed_at: Option<NaiveDate>,
 }
 
 impl VersionMarks {
@@ -140,7 +142,26 @@ pub struct BootSpan {
     pub end: DateTime<Utc>,
     pub clean: bool,
     pub kernel: Option<String>,
+    pub kernel_inferred: bool,
     pub pstore_hits: usize,
+}
+
+impl BootSpan {
+    /// The [`normalize`]d upstream version of the kernel it ran, if known.
+    pub fn version(&self) -> Option<String> {
+        self.kernel
+            .as_deref()
+            .map(|k| normalize(k.split('-').next().unwrap_or(k)))
+    }
+}
+
+/// An install or removal of one version, from the history log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub at: DateTime<Utc>,
+    pub removed: bool,
+    /// [`normalize`]d upstream version.
+    pub version: String,
 }
 
 /// This machine's side of the timeline.
@@ -150,6 +171,9 @@ pub struct Machine {
     pub marks: BTreeMap<String, VersionMarks>,
     pub series: Option<String>,
     pub boots: Vec<BootSpan>,
+    pub history: Vec<Change>,
+    /// How each kernel version has behaved here, keyed like `marks`.
+    pub records: BTreeMap<String, crate::evidence::KernelRecord>,
 }
 
 impl Machine {
@@ -190,6 +214,110 @@ pub struct Shape {
     /// The most relevant change descriptions: bug titles for Mesa, commit
     /// subjects touching loaded drivers for the kernel.
     pub notable: Vec<String>,
+    /// Every change touching this machine's drivers, with its ids, so later
+    /// reverts can be matched to it.
+    pub changes: Vec<ChangeRef>,
+    /// Every revert in the release: what it undoes.
+    pub reverts_of: Vec<RevertRef>,
+}
+
+/// A change to one of this machine's drivers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeRef {
+    pub subject: String,
+    pub driver: String,
+    pub tier: Tier,
+    /// Commit ids it is known by: its own and, for a stable backport, the
+    /// upstream one.
+    pub ids: Vec<String>,
+}
+
+/// A revert: the subject of what it undoes, and any commit ids it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevertRef {
+    pub subject: String,
+    pub ids: Vec<String>,
+}
+
+impl RevertRef {
+    /// Whether this revert undoes `change`: by commit id where both have one
+    /// (ids are compared on their first 12 characters, the usual short form),
+    /// else by subject.
+    pub fn undoes(&self, change: &ChangeRef) -> bool {
+        let short = |id: &str| id.chars().take(12).collect::<String>();
+        let by_id = self
+            .ids
+            .iter()
+            .any(|a| change.ids.iter().any(|b| short(a) == short(b)));
+        by_id || same_subject(&self.subject, &change.subject)
+    }
+}
+
+fn same_subject(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches('.').to_ascii_lowercase();
+    !a.trim().is_empty() && norm(a) == norm(b)
+}
+
+/// `Revert "drm/amdgpu: foo"` → `drm/amdgpu: foo`.
+fn reverted_subject(subject: &str) -> Option<String> {
+    let rest = subject.trim().strip_prefix("Revert ")?;
+    let rest = rest.trim();
+    let inner = rest
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .unwrap_or(rest);
+    Some(inner.to_string())
+}
+
+/// A change of this release that a later release reverted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reverted {
+    pub subject: String,
+    pub driver: String,
+    /// The release that reverted it.
+    pub by: String,
+}
+
+/// Per release of one series: its changes to this machine's drivers that
+/// were reverted later, and the earlier ones it reverts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Watch {
+    pub reverted_later: Vec<Reverted>,
+    /// (subject, driver, release it came from)
+    pub reverts_earlier: Vec<(String, String, String)>,
+}
+
+/// Match every revert in a series to the release whose change it undoes.
+/// `releases` are (version, shape) oldest first; releases whose shape is not
+/// known yet are skipped.
+pub fn revert_watch(releases: &[(&str, &Shape)]) -> BTreeMap<String, Watch> {
+    let mut out: BTreeMap<String, Watch> = BTreeMap::new();
+    for (j, (later, later_shape)) in releases.iter().enumerate() {
+        for revert in &later_shape.reverts_of {
+            for (earlier, earlier_shape) in releases[..j].iter().rev() {
+                if let Some(change) = earlier_shape.changes.iter().find(|c| revert.undoes(c)) {
+                    out.entry((*earlier).to_string())
+                        .or_default()
+                        .reverted_later
+                        .push(Reverted {
+                            subject: change.subject.clone(),
+                            driver: change.driver.clone(),
+                            by: (*later).to_string(),
+                        });
+                    out.entry((*later).to_string())
+                        .or_default()
+                        .reverts_earlier
+                        .push((
+                            change.subject.clone(),
+                            change.driver.clone(),
+                            (*earlier).to_string(),
+                        ));
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// How directly a driver concerns this machine.
@@ -501,24 +629,76 @@ impl Relevance {
     }
 }
 
-/// Shape a kernel.org ChangeLog.
+/// Shape a kernel.org ChangeLog, which is `git log` output of the stable
+/// branch: each commit's subject, its upstream id, and what it reverts.
 pub fn kernel_shape(
     text: &str,
     highlights: &BTreeMap<String, Regex>,
     relevance: &Relevance,
 ) -> Shape {
     let base = lineage::analyse_changelog(text, highlights);
-    // The first indented line after each `commit` header is its subject.
-    let mut subjects = Vec::new();
-    let mut want = false;
+    let header = Regex::new(r"^commit ([0-9a-f]{7,40})").expect("static regex");
+    let upstream =
+        Regex::new(r"(?:\[ Upstream commit ([0-9a-f]{7,40}) \]|commit ([0-9a-f]{7,40}) upstream)")
+            .expect("static regex");
+    let reverts_id = Regex::new(r"This reverts commit ([0-9a-f]{7,40})").expect("static regex");
+
+    struct Commit<'a> {
+        id: String,
+        subject: Option<&'a str>,
+        body: Vec<&'a str>,
+    }
+    let mut commits: Vec<Commit> = Vec::new();
     for line in text.lines() {
-        if line.starts_with("commit ") {
-            want = true;
-        } else if want && line.starts_with("    ") && !line.trim().is_empty() {
-            subjects.push(line.trim());
-            want = false;
+        if let Some(c) = header.captures(line) {
+            commits.push(Commit {
+                id: c[1].to_string(),
+                subject: None,
+                body: Vec::new(),
+            });
+        } else if let Some(c) = commits.last_mut() {
+            if line.starts_with("    ") && !line.trim().is_empty() {
+                if c.subject.is_none() {
+                    c.subject = Some(line.trim());
+                } else {
+                    c.body.push(line.trim());
+                }
+            }
         }
     }
+
+    let mut changes = Vec::new();
+    let mut reverts = Vec::new();
+    for c in &commits {
+        let Some(subject) = c.subject else { continue };
+        let mut ids = vec![c.id.clone()];
+        for line in &c.body {
+            if let Some(m) = upstream.captures(line) {
+                ids.extend(m.get(1).or(m.get(2)).map(|x| x.as_str().to_string()));
+            }
+        }
+        if let Some(inner) = reverted_subject(subject) {
+            let named: Vec<String> = c
+                .body
+                .iter()
+                .filter_map(|l| reverts_id.captures(l).map(|m| m[1].to_string()))
+                .collect();
+            reverts.push(RevertRef {
+                subject: inner,
+                ids: named,
+            });
+        } else if let Some((driver, tier @ Tier::Hardware)) = relevance.classify(subject) {
+            // Only this machine's own drivers are watched for reverts.
+            changes.push(ChangeRef {
+                subject: subject.to_string(),
+                driver: driver.to_string(),
+                tier,
+                ids,
+            });
+        }
+    }
+
+    let subjects: Vec<&str> = commits.iter().filter_map(|c| c.subject).collect();
     let (relevant, notable) = relevance.tally(subjects.iter().copied(), 40);
     Shape {
         patches: base.patches,
@@ -526,6 +706,8 @@ pub fn kernel_shape(
         highlights: base.highlights,
         relevant,
         notable,
+        changes,
+        reverts_of: reverts,
     }
 }
 
@@ -577,12 +759,38 @@ pub fn mesa_shape(
     notable.extend(rest);
     notable.truncate(40);
 
+    let change_refs = changes
+        .iter()
+        .filter(|c| !c.starts_with("Revert "))
+        .filter_map(|c| {
+            relevance
+                .classify(c)
+                .filter(|(_, t)| *t == Tier::Hardware)
+                .map(|(driver, tier)| ChangeRef {
+                    subject: c.clone(),
+                    driver: driver.to_string(),
+                    tier,
+                    ids: Vec::new(),
+                })
+        })
+        .collect();
+    let revert_refs = changes
+        .iter()
+        .filter_map(|c| reverted_subject(c))
+        .map(|subject| RevertRef {
+            subject,
+            ids: Vec::new(),
+        })
+        .collect();
+
     Shape {
         patches: changes.len(),
         reverts,
         highlights: highlight_counts,
         relevant,
         notable,
+        changes: change_refs,
+        reverts_of: revert_refs,
     }
 }
 
@@ -1329,6 +1537,52 @@ mod tests {
             "bodies do not count"
         );
         assert_eq!(s.notable, vec!["drm/amdgpu: fix display wake"]);
+    }
+
+    /// A stable backport is reverted in a later point release. The revert
+    /// names the stable commit; the original carries its upstream id too.
+    #[test]
+    fn a_later_revert_is_matched_to_the_change_it_undoes() {
+        let r = Relevance::from_modules(["amdgpu"]);
+        let v5 = "commit 1111111111111111111111111111111111111111\nAuthor: A <a@example.com>\n\n    drm/amdgpu: enable the shiny thing\n\n    [ Upstream commit 9999999999999999999999999999999999999999 ]\n\ncommit 2222222222222222222222222222222222222222\nAuthor: B <b@example.com>\n\n    drm/amdgpu: fix a leak\n";
+        let v6 = "commit 3333333333333333333333333333333333333333\nAuthor: C <c@example.com>\n\n    Revert \"drm/amdgpu: enable the shiny thing\"\n\n    This reverts commit 111111111111.\n";
+        let (s5, s6) = (
+            kernel_shape(v5, &BTreeMap::new(), &r),
+            kernel_shape(v6, &BTreeMap::new(), &r),
+        );
+        assert_eq!(s5.changes.len(), 2);
+        assert_eq!(s5.changes[0].ids.len(), 2, "own id and upstream id");
+        assert_eq!(s6.reverts_of.len(), 1);
+
+        let watch = revert_watch(&[("7.2.5", &s5), ("7.2.6", &s6)]);
+        let w5 = &watch["7.2.5"];
+        assert_eq!(w5.reverted_later.len(), 1);
+        assert_eq!(
+            w5.reverted_later[0].subject,
+            "drm/amdgpu: enable the shiny thing"
+        );
+        assert_eq!(w5.reverted_later[0].by, "7.2.6");
+        assert_eq!(watch["7.2.6"].reverts_earlier[0].2, "7.2.5");
+    }
+
+    #[test]
+    fn subjects_match_when_there_is_no_id() {
+        let change = ChangeRef {
+            subject: "radv: fix NGG culling".into(),
+            driver: "amdgpu".into(),
+            tier: Tier::Hardware,
+            ids: vec![],
+        };
+        let revert = RevertRef {
+            subject: "radv: fix NGG culling".into(),
+            ids: vec![],
+        };
+        assert!(revert.undoes(&change));
+        let other = RevertRef {
+            subject: "radv: something else".into(),
+            ids: vec![],
+        };
+        assert!(!other.undoes(&change));
     }
 
     #[test]

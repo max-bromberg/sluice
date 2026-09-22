@@ -21,6 +21,7 @@
 //! - [`lineage`] — upstream release history, cached and offline-capable.
 //! - [`timeline`] — every series laid out in time, with this machine overlaid.
 //! - [`health`] — boot evidence, including freezes that leave nothing in the log.
+//! - [`evidence`] — install history and per-kernel boot records, kept by root runs.
 //! - [`vault`] — kept RPMs, so a rollback target outlives the repository.
 
 pub mod app;
@@ -28,6 +29,7 @@ pub mod backend;
 pub mod boot;
 pub mod cli;
 pub mod config;
+pub mod evidence;
 pub mod exec;
 pub mod gate;
 pub mod health;
