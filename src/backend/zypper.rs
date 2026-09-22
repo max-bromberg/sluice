@@ -12,8 +12,9 @@ use crate::version::Evr;
 
 /// zypper exit codes that mean "worked, but something is pending".
 /// 0 ok, 100 updates available, 101 security updates available,
-/// 102 reboot required, 103 restart of the package manager needed.
-const SOFT_OK: &[i32] = &[0, 100, 101, 102, 103];
+/// 102 reboot required, 103 restart of the package manager needed,
+/// 106 some repositories were skipped (the rest were used).
+const SOFT_OK: &[i32] = &[0, 100, 101, 102, 103, 106];
 
 pub struct Zypper {
     /// Path to the zypper binary; configurable mainly so tests and containers
@@ -143,17 +144,23 @@ impl PackageBackend for Zypper {
     fn dist_upgrade(&self, r: &mut Runner, extra_args: &[String]) -> Result<Transaction> {
         let cmd = self.base(true).arg("dup").args(extra_args);
         let out = r.run(&cmd)?;
-        anyhow::ensure!(
-            SOFT_OK.contains(&out.status),
-            "zypper dup failed ({}):\n{}",
-            out.status,
-            out.stderr.trim()
-        );
+        if !SOFT_OK.contains(&out.status) {
+            anyhow::bail!(
+                "{}",
+                explain_dup_failure(out.status, &out.stdout, &out.stderr)
+            );
+        }
         Ok(Transaction {
             installed: Vec::new(),
             removed: Vec::new(),
+            summary: dup_summary(&out.stdout),
             output: out.stdout,
         })
+    }
+
+    fn needs_reboot(&self, r: &mut Runner) -> Result<bool> {
+        let out = r.run(&self.base(false).arg("needs-rebooting"))?;
+        Ok(out.status == 102)
     }
 
     fn install_exact(&self, r: &mut Runner, pkgs: &[Pkg]) -> Result<Transaction> {
@@ -180,6 +187,7 @@ impl PackageBackend for Zypper {
             installed: pkgs.to_vec(),
             removed: Vec::new(),
             output: out.stdout,
+            summary: None,
         })
     }
 
@@ -261,6 +269,7 @@ impl PackageBackend for Zypper {
             installed: Vec::new(),
             removed: pkgs.to_vec(),
             output: out.stdout,
+            summary: None,
         })
     }
 
@@ -396,6 +405,53 @@ fn parse_installed(text: &str) -> Vec<InstalledPkg> {
         .collect()
 }
 
+/// The line zypper prints before committing, e.g.
+/// `142 packages to upgrade, 3 new, 1 to remove.`, or that there was nothing.
+fn dup_summary(stdout: &str) -> Option<String> {
+    stdout.lines().map(str::trim).find_map(|l| {
+        let counted = l
+            .split_whitespace()
+            .next()
+            .is_some_and(|w| w.chars().all(|c| c.is_ascii_digit()))
+            && (l.contains(" to upgrade")
+                || l.contains(" new")
+                || l.contains(" to remove")
+                || l.contains(" to downgrade"));
+        (counted || l == "Nothing to do.").then(|| l.to_string())
+    })
+}
+
+/// A failed `zypper dup`, in words: what went wrong and what to do about it.
+/// zypper writes solver problems to stdout, so both streams are looked at.
+fn explain_dup_failure(status: i32, stdout: &str, stderr: &str) -> String {
+    let all = format!("{stdout}\n{stderr}");
+    let lower = all.to_ascii_lowercase();
+    let reason = if status == 7 || lower.contains("system management is locked") {
+        "another package manager was running (PackageKit, YaST or a zypper), so zypper could not start; the next run will try again"
+            .to_string()
+    } else if lower.contains("license") || lower.contains("licence") {
+        "a package's licence needs your agreement. Run `sudo zypper dup` once to read and accept it — the series gates still apply — or set `auto_agree_licenses = true` under [backend]"
+            .to_string()
+    } else if lower.contains("problem:") {
+        "zypper needs a decision it will not make unattended (a dependency conflict). Run `sudo zypper dup` to choose — the series gates still apply"
+            .to_string()
+    } else {
+        format!("zypper dup exited with status {status}")
+    };
+    // The last few meaningful lines, for the log and the notification.
+    let tail: Vec<&str> = all
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("Retrieving") && !l.starts_with("Loading"))
+        .collect();
+    let tail = tail[tail.len().saturating_sub(6)..].join("\n  ");
+    if tail.is_empty() {
+        reason
+    } else {
+        format!("{reason}\n  {tail}")
+    }
+}
+
 /// Parse `/etc/zypp/locks`, whose records are blank-line separated
 /// `attribute: value` blocks. See locks(5).
 fn parse_locks_file(text: &str) -> Result<Vec<LockSpec>> {
@@ -480,6 +536,44 @@ mod tests {
 
     /// `rpm -qa` lines in the shape Tumbleweed produces: Mesa is built from two
     /// sources at different releases, and Mesa-demo is not Mesa.
+    #[test]
+    fn a_dup_summary_is_found() {
+        let out = "Loading repository data...\nComputing distribution upgrade...\n\nThe following 142 packages are going to be upgraded:\n  a b c\n\n142 packages to upgrade, 3 new, 1 to remove.\nOverall download size: 512.0 MiB.\n";
+        assert_eq!(
+            dup_summary(out).as_deref(),
+            Some("142 packages to upgrade, 3 new, 1 to remove.")
+        );
+        assert_eq!(
+            dup_summary("Computing distribution upgrade...\nNothing to do.\n").as_deref(),
+            Some("Nothing to do.")
+        );
+    }
+
+    #[test]
+    fn a_failed_dup_says_why() {
+        let locked = explain_dup_failure(
+            7,
+            "",
+            "System management is locked by the application with pid 1234 (packagekitd).",
+        );
+        assert!(locked.contains("another package manager"), "{locked}");
+        let solver = explain_dup_failure(
+            4,
+            "Problem: nothing provides 'libfoo.so.3' needed by bar\n Solution 1: deinstall bar",
+            "",
+        );
+        assert!(
+            solver.contains("needs a decision") && solver.contains("libfoo"),
+            "{solver}"
+        );
+        let licence = explain_dup_failure(
+            4,
+            "In order to install 'x', you must agree to terms of the following license agreement:",
+            "",
+        );
+        assert!(licence.contains("auto_agree_licenses"), "{licence}");
+    }
+
     #[test]
     fn parses_source_packages() {
         let text = "Mesa\t0:26.2.2-2.1\tMesa-26.2.2-2.1.src.rpm\t1758240701\n\

@@ -357,6 +357,9 @@ pub struct BackendConfig {
     /// Program used to re-run sluice with privileges from the TUI.
     /// `auto` tries pkexec, then sudo.
     pub escalate_with: String,
+    /// Accept package licences during an unattended `update`. Off by
+    /// default: a licence then stops the update, and you are told.
+    pub auto_agree_licenses: bool,
 }
 
 impl Default for BackendConfig {
@@ -365,6 +368,7 @@ impl Default for BackendConfig {
             kind: BackendKind::Zypper,
             refresh: true,
             escalate_with: "auto".into(),
+            auto_agree_licenses: false,
         }
     }
 }

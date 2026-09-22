@@ -159,7 +159,7 @@ fn attention(d: &Dashboard) -> Vec<(String, Color)> {
         out.push((format!("◆ {} gated", gated.join(", ")), GATED));
     }
     if status.components.iter().any(|c| c.boot_drift.is_some()) {
-        out.push(("⚠ boot default moved".into(), BAD));
+        out.push(("! boot default moved".into(), BAD));
     }
     for c in &status.components {
         if c.eval.series_withdrawn {
@@ -170,10 +170,16 @@ fn attention(d: &Dashboard) -> Vec<(String, Color)> {
         }
     }
     if let Some(esp) = status.esp.as_ref().filter(|_| status.esp_low) {
-        out.push((format!("⚠ ESP {} MB free", esp.free_mb), GATED));
+        out.push((format!("! ESP {} MB free", esp.free_mb), GATED));
+    }
+    if status.last_update.as_ref().is_some_and(|r| !r.ok) {
+        out.push(("✘ update failed".into(), BAD));
+    }
+    if status.reboot_needed.is_some() {
+        out.push(("↻ reboot to finish updating".into(), AUTO));
     }
     if let Some(r) = &status.new_release {
-        out.push((format!("⬆ sluice {} — U", r.version()), AUTO));
+        out.push((format!("↑ sluice {} — U", r.version()), AUTO));
     }
     let unprotected: Vec<&str> = status
         .components
@@ -543,6 +549,51 @@ fn system_lines(d: &Dashboard) -> Vec<Line<'static>> {
             ),
         ]));
     }
+    // How the last update went: the thing to know before trusting the timer.
+    match &status.last_update {
+        Some(run) if run.ok => {
+            let mut text = format!(
+                "{} · ok",
+                run.finished
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+            );
+            if let Some(s) = &run.summary {
+                text.push_str(&format!(" · {s}"));
+            }
+            if !run.applied.is_empty() {
+                text.push_str(&format!(" · {}", run.applied.join(", ")));
+            }
+            lines.push(kv("last update", text));
+        }
+        Some(run) => {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<14}", "last update"), Style::default().fg(MUTED)),
+                Span::styled(
+                    format!(
+                        "{} · FAILED",
+                        run.started
+                            .with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M")
+                    ),
+                    Style::default().fg(BAD).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            for l in run.error.as_deref().unwrap_or("").lines().take(6) {
+                lines.push(Line::styled(
+                    format!("{:<14}{}", "", l.trim()),
+                    Style::default().fg(BAD),
+                ));
+            }
+        }
+        None => lines.push(kv("last update", "none recorded yet".into())),
+    }
+    if let Some(reason) = &status.reboot_needed {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<14}", "reboot"), Style::default().fg(MUTED)),
+            Span::styled(reason.clone(), Style::default().fg(AUTO)),
+        ]));
+    }
     if let Some(id) = crate::boot::default_entry_from_efivars(&d.app.config.boot.efivars_dir) {
         lines.push(kv("boot default", id));
     }
@@ -750,7 +801,7 @@ fn draw_confirm(f: &mut Frame, action: &super::state::PendingAction) {
     }
     if action.blocked {
         lines.push(Line::styled(
-            "this cannot go ahead until the ✖ above is dealt with",
+            "this cannot go ahead until the ✘ above is dealt with",
             Style::default().fg(BAD).add_modifier(Modifier::BOLD),
         ));
     } else {

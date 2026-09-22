@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use chrono::{Datelike, Duration, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate, Timelike};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -133,6 +133,12 @@ pub struct TimelineView {
     hits: Vec<(Rect, Hit)>,
     plot: Rect,
     row_y: Vec<(u16, u16, usize)>,
+}
+
+/// Where an instant sits on the axis: its local day plus the fraction of it.
+fn when(t: chrono::DateTime<chrono::Utc>) -> f64 {
+    let local = t.with_timezone(&chrono::Local);
+    day(local.date_naive()) + f64::from(local.num_seconds_from_midnight()) / 86_400.0
 }
 
 fn day(d: NaiveDate) -> f64 {
@@ -383,8 +389,39 @@ impl TimelineView {
                 .filter(|(_, b)| !b.clean)
                 .map(|(index, b)| (b.end.date_naive(), ItemRef::Boot { source, index })),
         );
-        items.sort_by_key(|(d, _)| *d);
+        // Same-day events keep their real order: an install before the boot
+        // that ran it, a removal after.
+        items.sort_by(|(da, a), (db, b)| self.item_x(*da, a).total_cmp(&self.item_x(*db, b)));
         items
+    }
+
+    /// The exact position of an item on the axis: boots, installs and
+    /// removals at their real time, releases at their date.
+    fn item_x(&self, date: NaiveDate, r: &ItemRef) -> f64 {
+        match r {
+            ItemRef::Boot { source, index } => self.sources[*source]
+                .machine
+                .boots
+                .get(*index)
+                .map_or(day(date), |b| when(b.end)),
+            ItemRef::Install {
+                source, version, ..
+            }
+            | ItemRef::Removal {
+                source, version, ..
+            } => {
+                let removed = matches!(r, ItemRef::Removal { .. });
+                self.sources[*source]
+                    .machine
+                    .history
+                    .iter()
+                    .find(|c| {
+                        c.removed == removed && &c.version == version && c.at.date_naive() == date
+                    })
+                    .map_or(day(date), |c| when(c.at))
+            }
+            _ => day(date),
+        }
     }
 
     fn items(&self, row: usize) -> Vec<(NaiveDate, ItemRef)> {
@@ -401,6 +438,12 @@ impl TimelineView {
 
     fn selected_date(&self) -> Option<NaiveDate> {
         self.items(self.row).get(self.item).map(|(d, _)| *d)
+    }
+
+    fn selected_x(&self) -> Option<f64> {
+        self.items(self.row)
+            .get(self.item)
+            .map(|(d, r)| self.item_x(*d, r))
     }
 
     fn select_ref(&mut self, target: &ItemRef) {
@@ -494,12 +537,11 @@ impl TimelineView {
     }
 
     fn ensure_visible(&mut self) {
-        let Some(d) = self.selected_date() else {
+        let Some(x) = self.selected_x() else {
             return;
         };
         let half = f64::from(self.plot.width.max(20)) / 2.0 * self.target_scale;
         let margin = half * 0.8;
-        let x = day(d);
         if (x - self.target_center).abs() > margin {
             self.target_center = x - margin.copysign(x - self.target_center) * 0.5;
         }
@@ -508,7 +550,7 @@ impl TimelineView {
     fn zoom(&mut self, factor: f64, anchor: Option<f64>) {
         let new_scale = (self.target_scale * factor).clamp(MIN_SCALE, MAX_SCALE);
         let a = anchor
-            .or_else(|| self.selected_date().map(day))
+            .or_else(|| self.selected_x())
             .unwrap_or(self.target_center);
         // Keep the anchor where it is on screen.
         self.target_center = a - (a - self.target_center) * (new_scale / self.target_scale);
@@ -532,19 +574,28 @@ impl TimelineView {
         if self.rows.is_empty() {
             return;
         }
-        let d = self.selected_date();
+        let from = self.selected_x();
         self.row = (self.row as isize + delta).clamp(0, self.rows.len() as isize - 1) as usize;
-        let items = self.items(self.row);
-        // Land on whatever is nearest in time, so moving between lanes feels
-        // like moving vertically on the canvas.
-        self.item = match d {
-            Some(d) => items
+        let items: Vec<f64> = self
+            .items(self.row)
+            .iter()
+            .map(|(d, r)| self.item_x(*d, r))
+            .collect();
+        // Move straight up or down the canvas: the nearest item in time,
+        // preferring one already on screen over a jump to another month.
+        let (lo, hi) = self.visible_days();
+        let nearest = |only_visible: bool| {
+            items
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, (x, _))| (*x - d).num_days().abs())
-                .map_or(0, |(i, _)| i),
-            None => items.len().saturating_sub(1),
+                .filter(|(_, x)| !only_visible || (lo..=hi).contains(*x))
+                .min_by(|(_, a), (_, b)| {
+                    let at = from.unwrap_or(self.center);
+                    (**a - at).abs().total_cmp(&(**b - at).abs())
+                })
+                .map(|(i, _)| i)
         };
+        self.item = nearest(true).or_else(|| nearest(false)).unwrap_or(0);
         self.ensure_visible();
     }
 
@@ -986,14 +1037,14 @@ impl TimelineView {
 
         // A legend, so the glyphs can be learned by looking.
         let legend: [(&str, &str, Style); 10] = [
-            ("▶", "running", Style::default().fg(AUTO)),
+            ("►", "running", Style::default().fg(AUTO)),
             ("●", "installed", Style::default().fg(GOOD)),
             ("★", "boots by default", Style::default().fg(STAR)),
-            ("✔", "known-good", Style::default().fg(GOOD)),
+            ("✓", "known-good", Style::default().fg(GOOD)),
             ("◆", "gated", Style::default().fg(GATED)),
             ("◉", "offered", Style::default().fg(AUTO)),
             ("◌", "expected", Style::default().fg(GHOST)),
-            ("✖", "unclean end", Style::default().fg(BAD)),
+            ("✘", "unclean end", Style::default().fg(BAD)),
             (
                 "◍",
                 "was installed",
@@ -1419,10 +1470,10 @@ impl TimelineView {
                 b.push('★');
             }
             if marks.known_good {
-                b.push('✔');
+                b.push('✓');
             }
             if marks.testing {
-                b.push('⚗');
+                b.push('◐');
             }
             if marks.vaulted && self.info >= 2 {
                 b.push('▣');
@@ -1432,7 +1483,7 @@ impl TimelineView {
                 .get(&crate::timeline::normalize(&r.version))
                 .is_some_and(|x| x.unclean > 0)
             {
-                b.push('⚠');
+                b.push('✘');
             }
             if watch
                 .get(&r.version)
@@ -1472,9 +1523,9 @@ impl TimelineView {
                 for ch in badges.chars() {
                     let color = match ch {
                         '★' => STAR,
-                        '✔' => GOOD,
-                        '⚗' => AUTO,
-                        '⚠' => BAD,
+                        '✓' => GOOD,
+                        '◐' => AUTO,
+                        '✘' => BAD,
                         '↺' => GATED,
                         _ => MUTED,
                     };
@@ -1611,8 +1662,8 @@ impl TimelineView {
         };
         // Boots as a strip: each boot a run of blocks, a freeze a red cross.
         for b in &s.machine.boots {
-            let from = day(b.start.date_naive());
-            let to = day(b.end.date_naive());
+            let from = when(b.start);
+            let to = when(b.end);
             let lit = selected_version.is_some() && b.version() == selected_version;
             let (ch, color) = if lit {
                 (
@@ -1632,7 +1683,7 @@ impl TimelineView {
                         break;
                     }
                     let cell = &mut buf[(c, y)];
-                    if cell.symbol() != "✖" {
+                    if cell.symbol() != "✘" {
                         cell.set_char(ch).set_fg(color);
                     }
                 }
@@ -1642,7 +1693,7 @@ impl TimelineView {
                     if c < reveal_col {
                         let color = if b.pstore_hits > 0 { WHITE } else { BAD };
                         buf[(c, y)]
-                            .set_char('✖')
+                            .set_char('✘')
                             .set_style(Style::default().fg(color).add_modifier(Modifier::BOLD));
                     }
                 }
@@ -1657,21 +1708,21 @@ impl TimelineView {
         }
         // Installs (▼) and removals (▽): when each version came and went.
         let mut occupied: Vec<(u16, u16)> = Vec::new();
-        let events: Vec<(NaiveDate, String, bool)> = if s.machine.history.is_empty() {
+        let events: Vec<(f64, String, bool)> = if s.machine.history.is_empty() {
             s.machine
                 .marks
                 .iter()
-                .filter_map(|(v, m)| m.installed_at.map(|d| (d, v.clone(), false)))
+                .filter_map(|(v, m)| m.installed_at.map(|d| (day(d), v.clone(), false)))
                 .collect()
         } else {
             s.machine
                 .history
                 .iter()
-                .map(|c| (c.at.date_naive(), c.version.clone(), c.removed))
+                .map(|c| (when(c.at), c.version.clone(), c.removed))
                 .collect()
         };
-        for (d, v, removed) in events {
-            let Some(c) = self.col(day(d)) else { continue };
+        for (x, v, removed) in events {
+            let Some(c) = self.col(x) else { continue };
             if c >= reveal_col {
                 continue;
             }
@@ -1747,10 +1798,10 @@ impl TimelineView {
     }
 
     fn draw_cursor(&self, buf: &mut Buffer, axis_y: u16, bottom: u16) {
-        let Some(d) = self.selected_date() else {
+        let (Some(d), Some(x)) = (self.selected_date(), self.selected_x()) else {
             return;
         };
-        let Some(c) = self.col(day(d)) else { return };
+        let Some(c) = self.col(x) else { return };
         for y in axis_y + 2..bottom {
             buf[(c, y)].set_bg(CURSOR_BG);
         }
@@ -2090,7 +2141,7 @@ impl TimelineView {
                 let hours = (b.end - b.start).num_minutes() as f64 / 60.0;
                 lines.push(vec![
                     (
-                        "✖ ".into(),
+                        "✘ ".into(),
                         Style::default().fg(BAD).add_modifier(Modifier::BOLD),
                     ),
                     (
@@ -2198,7 +2249,7 @@ fn release_glyph(r: &Release, m: &VersionMarks, mine: bool, elapsed: f64) -> (ch
     let pulse = 0.5 + 0.5 * (elapsed / 380.0).sin();
     if m.running {
         return (
-            '▶',
+            '►',
             Style::default()
                 .fg(mix(AUTO, WHITE, pulse))
                 .add_modifier(Modifier::BOLD),
@@ -2236,7 +2287,7 @@ fn chips(m: &VersionMarks) -> Vec<(String, Style)> {
     let mut v = Vec::new();
     let gap = || (" ".to_string(), Style::default());
     if m.running {
-        v.push(chip("▶ running", AUTO));
+        v.push(chip("► running", AUTO));
         v.push(gap());
     }
     if m.installed {
@@ -2248,11 +2299,11 @@ fn chips(m: &VersionMarks) -> Vec<(String, Style)> {
         v.push(gap());
     }
     if m.known_good {
-        v.push(chip("✔ known-good", GOOD));
+        v.push(chip("✓ known-good", GOOD));
         v.push(gap());
     }
     if m.testing {
-        v.push(chip("⚗ testing", AUTO));
+        v.push(chip("◐ testing", AUTO));
         v.push(gap());
     }
     if m.gated {
@@ -2449,7 +2500,7 @@ mod tests {
         v.rebuild_rows();
         let screen = render(&mut v);
         assert!(
-            screen.contains('⚠'),
+            screen.contains('✘'),
             "a kernel with unclean ends is flagged:\n{screen}"
         );
         assert!(
@@ -2511,6 +2562,96 @@ mod tests {
         );
     }
 
+    /// Events on the same day are scrubbed in the order they happened, not
+    /// in whatever order they were collected.
+    #[test]
+    fn same_day_events_keep_their_real_order() {
+        let mut v = view();
+        {
+            let m = &mut v.sources[0].machine;
+            let t = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+            // Collected out of order on purpose.
+            m.history.push(crate::timeline::Change {
+                at: t("2026-08-27T16:05:00Z"),
+                removed: true,
+                version: "7.1.2".into(),
+            });
+            m.history.push(crate::timeline::Change {
+                at: t("2026-08-27T16:00:00Z"),
+                removed: false,
+                version: "7.2.0".into(),
+            });
+            m.boots.push(crate::timeline::BootSpan {
+                start: t("2026-08-27T08:00:00Z"),
+                end: t("2026-08-27T15:00:00Z"),
+                clean: false,
+                kernel: None,
+                kernel_inferred: false,
+                pstore_hits: 0,
+            });
+        }
+        v.sources[0].boots = true;
+        v.rebuild_rows();
+        let machine_row = v
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowKind::Machine { .. }))
+            .unwrap();
+        let order: Vec<&str> = v
+            .items(machine_row)
+            .iter()
+            .map(|(_, r)| match r {
+                ItemRef::Boot { .. } => "boot",
+                ItemRef::Install { .. } => "install",
+                ItemRef::Removal { .. } => "removal",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(order, vec!["boot", "install", "removal"]);
+    }
+
+    #[test]
+    fn moving_between_rows_prefers_what_is_on_screen() {
+        let mut v = view();
+        let old = Lane {
+            series: "7.1".into(),
+            start: Some(d("2026-06-14")),
+            end: Some(d("2026-09-02")),
+            state: LaneState::Eol,
+            releases: vec![
+                Release {
+                    version: "7.1".into(),
+                    date: d("2026-06-14"),
+                    kind: ReleaseKind::Mainline,
+                    inferred: false,
+                },
+                Release {
+                    version: "7.1.13".into(),
+                    date: d("2026-09-02"),
+                    kind: ReleaseKind::Point,
+                    inferred: false,
+                },
+            ],
+            projections: vec![],
+        };
+        let mut up = v.sources[0].upstream.clone().unwrap();
+        up.lanes.push(old);
+        v.set_upstream("kernel", up);
+        render(&mut v);
+        // From 7.2.7 (late September), straight down lands on 7.1.13, which
+        // is on screen, not the June mainline.
+        v.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        v.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        v.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        match v.selected() {
+            Some(ItemRef::Release { lane, index, .. }) => {
+                let r = &v.sources[0].upstream.as_ref().unwrap().lanes[lane].releases[index];
+                assert_eq!(r.version, "7.1.13");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn opens_on_the_running_version() {
         let v = view();
@@ -2526,7 +2667,7 @@ mod tests {
         let mut v = view();
         let screen = render(&mut v);
         assert!(
-            screen.contains('▶'),
+            screen.contains('►'),
             "the running version is marked:\n{screen}"
         );
         assert!(

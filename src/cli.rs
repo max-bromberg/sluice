@@ -354,6 +354,32 @@ pub fn render_status(s: &Status, style: Style) -> String {
     for w in &s.warnings {
         out.push_str(&format!("{}\n", style.dim(&format!("note: {w}"))));
     }
+    match &s.last_update {
+        Some(run) if !run.ok => {
+            out.push_str(&format!(
+                "{}\n",
+                style.red(&format!(
+                    "the last update ({}) failed: {}",
+                    run.started
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M"),
+                    run.error.as_deref().unwrap_or("unknown error")
+                ))
+            ));
+        }
+        Some(run) => out.push_str(&style.dim(&format!(
+            "last update: {}{}\n",
+            run.finished.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"),
+            run.summary.as_deref().map(|s| format!(" · {s}")).unwrap_or_default()
+        ))),
+        None => {}
+    }
+    if let Some(reason) = &s.reboot_needed {
+        out.push_str(&format!(
+            "{}\n",
+            style.cyan(&format!("reboot to finish updating: {reason}"))
+        ));
+    }
     if let Some(r) = &s.new_release {
         out.push_str(&format!(
             "{}\n",
@@ -381,6 +407,9 @@ pub fn render_update(r: &UpdateReport, style: Style, dry_run: bool) -> String {
         out.push('\n');
     }
 
+    if let Some(s) = &r.summary {
+        out.push_str(&format!("{}\n", style.dim(&format!("zypper: {s}"))));
+    }
     if r.applied.is_empty() {
         out.push_str(&style.dim("nothing to apply\n"));
     } else {
@@ -417,6 +446,12 @@ pub fn render_update(r: &UpdateReport, style: Style, dry_run: bool) -> String {
 
     for note in &r.notes {
         out.push_str(&format!("{}\n", style.yellow(&format!("note: {note}"))));
+    }
+    if let Some(reason) = &r.reboot_needed {
+        out.push_str(&format!(
+            "{}\n",
+            style.cyan(&format!("reboot to finish: {reason}"))
+        ));
     }
 
     out

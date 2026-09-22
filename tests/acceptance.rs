@@ -688,3 +688,76 @@ fn promote_preview_shows_the_move_and_its_safety_net() {
         "a preview installs nothing"
     );
 }
+
+/// A failed unattended update is recorded, announced once, and says why.
+#[test]
+fn a_failed_update_is_recorded_and_announced_once() {
+    let f = Fixture::new();
+    let backend = std::rc::Rc::new(f.tumbleweed_on_7_2());
+    *backend.dup_failure.borrow_mut() =
+        Some("zypper needs a decision it will not make unattended (a dependency conflict)".into());
+    let mut app = App::new(f.config.clone(), false)
+        .unwrap()
+        .with_backend(Box::new(std::rc::Rc::clone(&backend)));
+
+    assert!(app.update(now()).is_err());
+    let run = app.state.last_update_run().unwrap();
+    assert!(!run.ok);
+    assert!(run.error.as_deref().unwrap().contains("needs a decision"));
+
+    let first = app.check(now(), false).unwrap();
+    assert!(
+        first
+            .alerts
+            .iter()
+            .any(|(_, m)| m.contains("failed: zypper needs a decision")),
+        "{:?}",
+        first.alerts
+    );
+    let second = app.check(now() + Duration::days(1), false).unwrap();
+    assert!(
+        !second.alerts.iter().any(|(_, m)| m.contains("failed:")),
+        "the same failure is not announced twice: {:?}",
+        second.alerts
+    );
+
+    // It works again: recorded, and the summary kept.
+    *backend.dup_failure.borrow_mut() = None;
+    *backend.dup_summary.borrow_mut() = Some("142 packages to upgrade.".into());
+    app.update(now() + Duration::days(2)).unwrap();
+    let run = app.state.last_update_run().unwrap();
+    assert!(run.ok);
+    assert_eq!(run.summary.as_deref(), Some("142 packages to upgrade."));
+    assert!(run.applied.iter().any(|a| a.starts_with("kernel 7.2.6")));
+}
+
+/// Installing a newer kernel means running an older one until a reboot.
+#[test]
+fn a_reboot_is_called_for_when_the_running_kernel_is_behind() {
+    let f = Fixture::new();
+    let mut app = f.app(f.tumbleweed_on_7_2());
+    app.running_kernel = Some("7.2.0-1-default".into());
+
+    let report = app.update(now()).unwrap();
+    let reason = report
+        .reboot_needed
+        .expect("7.2.6 was installed while 7.2.0 runs");
+    assert!(
+        reason.contains("7.2.6") && reason.contains("7.2.0-1-default"),
+        "{reason}"
+    );
+
+    let first = app.check(now(), false).unwrap();
+    assert!(first
+        .alerts
+        .iter()
+        .any(|(_, m)| m.starts_with("reboot to finish updating")));
+    let again = app.check(now() + Duration::days(1), false).unwrap();
+    assert!(
+        !again.alerts.iter().any(|(_, m)| m.starts_with("reboot")),
+        "said once"
+    );
+
+    app.running_kernel = Some("7.2.6-1-default".into());
+    assert!(app.status(now()).unwrap().reboot_needed.is_none());
+}

@@ -18,6 +18,11 @@ pub struct MockBackend {
     /// Every `remove_exact` call.
     pub removals: RefCell<Vec<Vec<String>>>,
     pub dups: RefCell<u32>,
+    /// Set to make `dist_upgrade` fail with this message.
+    pub dup_failure: RefCell<Option<String>>,
+    /// The summary a successful `dist_upgrade` reports.
+    pub dup_summary: RefCell<Option<String>>,
+    pub reboot_flag: RefCell<bool>,
     pub changelogs: RefCell<std::collections::BTreeMap<String, String>>,
     /// Registered local repositories: alias -> (directory, priority).
     pub repos: RefCell<std::collections::BTreeMap<String, (PathBuf, u32)>>,
@@ -112,7 +117,17 @@ impl PackageBackend for MockBackend {
 
     fn dist_upgrade(&self, _r: &mut Runner, _extra: &[String]) -> Result<Transaction> {
         *self.dups.borrow_mut() += 1;
-        Ok(Transaction::default())
+        if let Some(e) = &*self.dup_failure.borrow() {
+            anyhow::bail!("{e}");
+        }
+        Ok(Transaction {
+            summary: self.dup_summary.borrow().clone(),
+            ..Default::default()
+        })
+    }
+
+    fn needs_reboot(&self, _r: &mut Runner) -> Result<bool> {
+        Ok(*self.reboot_flag.borrow())
     }
 
     fn install_exact(&self, _r: &mut Runner, pkgs: &[Pkg]) -> Result<Transaction> {
@@ -134,6 +149,7 @@ impl PackageBackend for MockBackend {
             installed: pkgs.to_vec(),
             removed: Vec::new(),
             output: String::new(),
+            summary: None,
         })
     }
 
@@ -153,6 +169,7 @@ impl PackageBackend for MockBackend {
             installed: Vec::new(),
             removed: pkgs.to_vec(),
             output: String::new(),
+            summary: None,
         })
     }
 

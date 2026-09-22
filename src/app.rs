@@ -45,6 +45,9 @@ pub struct Status {
     pub warnings: Vec<String>,
     /// A newer sluice release, if one is out.
     pub new_release: Option<crate::selfupdate::Release>,
+    /// Why a reboot is due, if one is.
+    pub reboot_needed: Option<String>,
+    pub last_update: Option<crate::state::UpdateRun>,
 }
 
 pub struct ComponentStatus {
@@ -343,6 +346,7 @@ impl App {
             });
         }
 
+        let reboot_needed = self.reboot_needed(&components);
         Ok(Status {
             components,
             esp,
@@ -351,6 +355,8 @@ impl App {
             health,
             vault_bytes: vault::size_bytes(&self.config.paths.vault_dir),
             warnings,
+            reboot_needed,
+            last_update: self.state.last_update_run().cloned(),
             new_release: crate::selfupdate::available(
                 &self.config.self_update,
                 &self.config.lineage,
@@ -363,7 +369,40 @@ impl App {
     // update
     // -----------------------------------------------------------------------
 
+    /// Refresh, apply what the policies allow, and report. Every run is
+    /// recorded — a failed unattended update must not pass unnoticed.
     pub fn update(&mut self, now: DateTime<Utc>) -> Result<UpdateReport> {
+        let started = Utc::now();
+        let result = self.update_inner(now);
+        if !self.runner.dry_run() {
+            let run = match &result {
+                Ok(r) => crate::state::UpdateRun {
+                    started,
+                    finished: Utc::now(),
+                    ok: true,
+                    error: None,
+                    applied: r.applied.iter().map(|(c, v)| format!("{c} {v}")).collect(),
+                    summary: r.summary.clone(),
+                },
+                Err(e) => crate::state::UpdateRun {
+                    started,
+                    finished: Utc::now(),
+                    ok: false,
+                    error: Some(format!("{e:#}")),
+                    applied: Vec::new(),
+                    summary: None,
+                },
+            };
+            self.state.record_update(run);
+            if let Err(e) = self.save() {
+                self.runner
+                    .note(&format!("could not record the update run: {e:#}"));
+            }
+        }
+        result
+    }
+
+    fn update_inner(&mut self, now: DateTime<Utc>) -> Result<UpdateReport> {
         let mut report = UpdateReport::default();
         if let Some(msg) = self.repair_locks()? {
             report.notes.push(msg);
@@ -386,7 +425,12 @@ impl App {
         report.lock_changes = self.reconcile_locks(now)?;
 
         let evals = self.evaluate(now)?;
-        self.backend.dist_upgrade(&mut self.runner, &[])?;
+        let mut dup_args = Vec::new();
+        if self.config.backend.auto_agree_licenses {
+            dup_args.push("--auto-agree-with-licenses".to_string());
+        }
+        let transaction = self.backend.dist_upgrade(&mut self.runner, &dup_args)?;
+        report.summary = transaction.summary;
         report.dup_ran = true;
 
         for eval in &evals {
@@ -451,6 +495,21 @@ impl App {
                 .push(format!("boot evidence not recorded: {e:#}"));
         }
         self.state.last_update = Some(now);
+        let evals = self.evaluate(now)?;
+        let statuses: Vec<ComponentStatus> = evals
+            .into_iter()
+            .map(|eval| ComponentStatus {
+                lifecycle: Lifecycle::Unvetted,
+                known_good: None,
+                known_good_vaulted: false,
+                health: None,
+                upstream: None,
+                upstream_eol_days: None,
+                boot_drift: None,
+                eval,
+            })
+            .collect();
+        report.reboot_needed = self.reboot_needed(&statuses);
         self.save()?;
         Ok(report)
     }
@@ -1137,6 +1196,30 @@ impl App {
         let cfg = self.config.component(component)?.clone();
         let (installed, _) = self.packages(&cfg)?;
         Ok(installed.iter().any(|p| &p.evr == version))
+    }
+
+    /// Why a reboot is due, if one is: the running kernel is not the one
+    /// this machine is meant to boot (a newer fix is installed, or a promotion
+    /// or rollback is waiting), or zypper says core libraries were updated.
+    pub fn reboot_needed(&mut self, components: &[ComponentStatus]) -> Option<String> {
+        let running = self.running_kernel.clone();
+        for c in components {
+            let Some(expected) = self.expected_boot_version(&c.eval) else {
+                continue;
+            };
+            if let Some(running) = &running {
+                if !boot::kernel_release_matches(running, &expected) {
+                    return Some(format!(
+                        "{} {expected} is installed; the machine is running {running}",
+                        c.eval.component
+                    ));
+                }
+            }
+        }
+        if self.backend.needs_reboot(&mut self.runner).unwrap_or(false) {
+            return Some("core libraries or services were updated".into());
+        }
+        None
     }
 
     /// Whether the default boot entry has drifted off what `eval` is holding.
@@ -1849,6 +1932,53 @@ impl App {
             alerts.push((Urgency::Warning, msg));
         }
 
+        // A failed update is news once; a machine that has not updated
+        // successfully in two weeks is a condition, and is repeated.
+        let mut announce_failure = None;
+        if let Some(run) = self.state.last_update_run().cloned() {
+            if !run.ok && (force || self.state.announced_failure != Some(run.started)) {
+                let why = run.error.as_deref().unwrap_or("unknown error");
+                alerts.push((
+                    Urgency::Warning,
+                    format!(
+                        "the update on {} failed: {}",
+                        run.started
+                            .with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M"),
+                        why.lines().next().unwrap_or(why)
+                    ),
+                ));
+                announce_failure = Some(run.started);
+            }
+            let since = self.state.last_successful_update().map(|r| r.finished);
+            let stale = match since {
+                Some(t) => now - t > Duration::days(14),
+                None => true,
+            };
+            if !run.ok && stale {
+                alerts.push((
+                    Urgency::Warning,
+                    match since {
+                        Some(t) => format!(
+                            "no update has succeeded since {}",
+                            t.with_timezone(&chrono::Local).format("%Y-%m-%d")
+                        ),
+                        None => "no update has succeeded yet".into(),
+                    },
+                ));
+            }
+        }
+        let mut announce_reboot = None;
+        if let Some(reason) = &status.reboot_needed {
+            if force || self.state.announced_reboot.as_deref() != Some(reason.as_str()) {
+                alerts.push((
+                    Urgency::Info,
+                    format!("reboot to finish updating: {reason}"),
+                ));
+                announce_reboot = Some(reason.clone());
+            }
+        }
+
         // A new sluice is announced once, like a gated series.
         let mut announce_release = None;
         if let Some(r) = &status.new_release {
@@ -1901,6 +2031,12 @@ impl App {
 
             if let Some(v) = announce_release {
                 self.state.announced_release = Some(v);
+            }
+            if let Some(t) = announce_failure {
+                self.state.announced_failure = Some(t);
+            }
+            if announce_reboot.is_some() {
+                self.state.announced_reboot = announce_reboot;
             }
             for (component, version) in announced {
                 let cstate = self.state.component_mut(&component);
@@ -2243,6 +2379,10 @@ fn match_kernel_health(report: &HealthReport, installed: &Evr) -> Option<KernelH
 #[derive(Debug, Default)]
 pub struct UpdateReport {
     pub dup_ran: bool,
+    /// zypper's one-line summary of the upgrade.
+    pub summary: Option<String>,
+    /// Why a reboot is now due, if one is.
+    pub reboot_needed: Option<String>,
     pub applied: Vec<(String, Evr)>,
     pub gated: Vec<(String, String, Evr)>,
     pub soaking: Vec<(String, Evr, DateTime<Utc>)>,

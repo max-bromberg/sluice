@@ -124,6 +124,20 @@ impl ComponentState {
     }
 }
 
+/// One run of `sluice update`, kept so failures and pending reboots are seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateRun {
+    pub started: DateTime<Utc>,
+    pub finished: DateTime<Utc>,
+    pub ok: bool,
+    /// Why it failed, in words, with zypper's last lines.
+    pub error: Option<String>,
+    /// What sluice applied itself, e.g. `kernel 7.2.6-1.1`.
+    pub applied: Vec<String>,
+    /// zypper's own one-line summary of the upgrade.
+    pub summary: Option<String>,
+}
+
 /// What `migrate` replaced, so `migrate --undo` can restore it exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationRecord {
@@ -148,6 +162,12 @@ pub struct State {
     pub pinned: Vec<Evr>,
     /// The newest sluice release already announced, so `check` says it once.
     pub announced_release: Option<String>,
+    /// Recent update runs, newest last.
+    pub update_runs: Vec<UpdateRun>,
+    /// The failed run already announced (by its start time).
+    pub announced_failure: Option<DateTime<Utc>>,
+    /// The reboot reason already announced.
+    pub announced_reboot: Option<String>,
 }
 
 impl Default for State {
@@ -160,6 +180,9 @@ impl Default for State {
             last_check: None,
             pinned: Vec::new(),
             announced_release: None,
+            update_runs: Vec::new(),
+            announced_failure: None,
+            announced_reboot: None,
         }
     }
 }
@@ -198,6 +221,20 @@ impl State {
             .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
+    }
+
+    pub fn record_update(&mut self, run: UpdateRun) {
+        self.update_runs.push(run);
+        let excess = self.update_runs.len().saturating_sub(30);
+        self.update_runs.drain(..excess);
+    }
+
+    pub fn last_update_run(&self) -> Option<&UpdateRun> {
+        self.update_runs.last()
+    }
+
+    pub fn last_successful_update(&self) -> Option<&UpdateRun> {
+        self.update_runs.iter().rev().find(|r| r.ok)
     }
 
     pub fn component(&self, name: &str) -> ComponentState {

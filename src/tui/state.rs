@@ -465,7 +465,7 @@ impl Dashboard {
                 let fatal = p.to.is_some() || previews.len() == 1;
                 out.push((
                     if fatal { Tone::Bad } else { Tone::Faint },
-                    format!("  ✖ {b}"),
+                    format!("  ✘ {b}"),
                 ));
                 blocked |= fatal;
             }
@@ -477,7 +477,7 @@ impl Dashboard {
             }
             match (&p.known_good, p.known_good_vaulted) {
                 (Some(kg), true) => {
-                    out.push((Tone::Good, format!("  ✔ rollback target {kg}, vaulted")))
+                    out.push((Tone::Good, format!("  ✓ rollback target {kg}, vaulted")))
                 }
                 (Some(kg), false) => {
                     out.push((Tone::Warn, format!("  rollback target {kg} is NOT vaulted")))
@@ -540,15 +540,15 @@ impl Dashboard {
         details.push((Tone::Plain, String::new()));
         details.push((
             Tone::Good,
-            "✔ checked against the release's SHA256SUMS before use".into(),
+            "✓ checked against the release's SHA256SUMS before use".into(),
         ));
         details.push((
             Tone::Good,
-            "✔ run once to confirm it works before it replaces anything".into(),
+            "✓ run once to confirm it works before it replaces anything".into(),
         ));
         details.push((
             Tone::Good,
-            "✔ the current version is kept: `sluice self-update --rollback`".into(),
+            "✓ the current version is kept: `sluice self-update --rollback`".into(),
         ));
         a.details = details;
         Some(a)

@@ -146,6 +146,8 @@ pub struct Transaction {
     pub installed: Vec<Pkg>,
     pub removed: Vec<Pkg>,
     pub output: String,
+    /// One line on what changed, e.g. `142 packages to upgrade, 3 new.`
+    pub summary: Option<String>,
 }
 
 pub trait PackageBackend {
@@ -194,6 +196,10 @@ pub trait PackageBackend {
 
     /// A full distribution upgrade, with whatever locks are currently in place.
     fn dist_upgrade(&self, r: &mut Runner, extra_args: &[String]) -> Result<Transaction>;
+
+    /// Whether the package manager says a reboot is due: a core library or
+    /// service was updated since boot.
+    fn needs_reboot(&self, r: &mut Runner) -> Result<bool>;
 
     /// Install exactly these versions, as one transaction.
     fn install_exact(&self, r: &mut Runner, pkgs: &[Pkg]) -> Result<Transaction>;
@@ -252,6 +258,9 @@ impl<T: PackageBackend + ?Sized> PackageBackend for std::rc::Rc<T> {
     }
     fn dist_upgrade(&self, r: &mut Runner, extra_args: &[String]) -> Result<Transaction> {
         (**self).dist_upgrade(r, extra_args)
+    }
+    fn needs_reboot(&self, r: &mut Runner) -> Result<bool> {
+        (**self).needs_reboot(r)
     }
     fn install_exact(&self, r: &mut Runner, pkgs: &[Pkg]) -> Result<Transaction> {
         (**self).install_exact(r, pkgs)

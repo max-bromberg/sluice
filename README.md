@@ -28,10 +28,10 @@ sluice separates the two:
 │                 Aug                     Sep                  today        Oct                    │
 │ 7.3                        ┄┄┄⋄┄┄┄┄⋄┄┄┄┄⋄┄┄┄┄◇┄┄│┄┄◌┄┄┄┄┄┄┄┄┄┄┄┄◇                         │
 │                               rc1  rc2  rc3  rc4 │  rc5?          7.3?                       │
-│▸7.2                        ▶━━━━━○○━━○━━○━━○━◉━━○│┄◌                                         │
+│▸7.2                        ►━━━━━○○━━○━━○━━○━◉━━○│┄◌                                         │
 │                            ★7.2  7.2.1  7.2.4 7.2.6 7.2.8?                                    │
 │ 7.1   ─○───○───○───○──○──○──○──○┤EOL             │                                         │
-│ boots ▂▂✖▂▂▂▂▂▂▂▂✖▂▂   ▂▂▂▼▂▂▂▂▂▂▂✖▂▂▂ ▂▂▂▂▂▂ ▂✖                                           │
+│ boots ▂▂✘▂▂▂▂▂▂▂▂✘▂▂   ▂▂▂▼▂▂▂▂▂▂▂✘▂▂▂ ▂▂▂▂▂▂ ▂✘                                           │
 │────────────────────────────────────────────────────────────────────────────────────────────│
 │ ○ kernel 7.2.5   point release · 11 days ago                                                │
 │ 558 changes · 3 reverts · touches this machine: amdgpu 30 · nvme 2 · kvm_amd 16              │
@@ -139,13 +139,13 @@ package is a lane in time; this machine is drawn on top of it:
 
 | | |
 |---|---|
-| `▶` | the version running now (it pulses) |
+| `►` | the version running now (it pulses) |
 | `●` | installed |
-| `★` `✔` `⚗` | boots by default · known-good · under test |
+| `★` `✓` `◐` | boots by default · known-good · under test |
 | `◆` | gated, waiting for your decision |
 | `◉` | offered by your repositories, not installed yet |
 | `◌` `◇` | releases not out yet, placed by their cadence — always a guess, and drawn as one |
-| `▂` `✖` | your boots, and the ones that ended without a shutdown |
+| `▂` `✘` | your boots, and the ones that ended without a shutdown |
 
 Scrub release by release with `←` `→`, move between series with `↑` `↓`, pan
 with `⇧←` `⇧→` or by dragging, and zoom from days to years with `+` `−` or the
@@ -157,7 +157,7 @@ Your own history is on it too. Every version this machine has installed and
 removed appears on the machine row (`▼` `▽`), a kernel you once had shows `◍`,
 and scrubbing to a kernel lights up the boots that ran it. Each kernel's card
 carries its record here — boots, hours, unclean ends, and unclean ends per
-100 hours so short and long stints compare fairly — and a `⚠` marks kernels
+100 hours so short and long stints compare fairly — and a `✘` marks kernels
 that have ended a boot uncleanly.
 
 A `↺` marks a release whose changes to this machine's drivers were reverted in
