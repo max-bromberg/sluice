@@ -1,0 +1,15 @@
+[Unit]
+Description=Weekly sluice update
+Documentation=https://github.com/max-bromberg/sluice
+
+# Deliberately NOT enabled by default. An unattended update is a policy choice,
+# not a default: enable it only once you trust your gates.
+#   systemctl enable --now sluice-update.timer
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=4h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

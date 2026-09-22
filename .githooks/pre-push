@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Enable with: git config core.hooksPath .githooks
+set -euo pipefail
+scripts/privacy-check.sh --commits HEAD
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features --quiet

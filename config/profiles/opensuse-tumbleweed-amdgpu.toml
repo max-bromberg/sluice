@@ -1,0 +1,93 @@
+# Example profile: an openSUSE Tumbleweed workstation with an AMD GPU.
+#
+# An illustration of what a considered, filled-in profile looks like — not a
+# default. Nothing in sluice assumes this hardware, these paths or these
+# thresholds.
+#
+# The kind of machine it describes:
+#   - Tumbleweed, systemd-boot via sdbootutil, btrfs with snapper
+#   - a recent AMD GPU on the amdgpu driver, where new kernel series are the
+#     main source of regressions and point releases carry the fixes
+#   - hard freezes that leave nothing in the journal are the failure to guard
+#     against, which is why boot-health evidence matters more than changelogs
+#
+# Why these settings:
+#   - kernel is hold-series: feature series are the risk and point releases the
+#     fix, so the two must be separated
+#   - the amdgpu highlight regex turns "412 patches" into "38 of them touch the
+#     driver most likely to break this kind of machine"
+#   - promote_hint_min_point = 3: .0 and .1 of a series are where regressions
+#     tend to cluster
+#   - Mesa and firmware start on `follow` and tighten later, once the kernel
+#     gate has proven itself
+
+[paths]
+state_dir = "/var/lib/sluice"
+cache_dir = "/var/cache/sluice"
+vault_dir = "/var/lib/sluice/vault"
+log_file  = "/var/log/sluice.log"
+
+[boot]
+esp_path = "/boot/efi"
+# On a 1 GB ESP, 256 MB of headroom is roughly one more kernel plus its
+# initrd, so the warning fires while there is still time to act rather than
+# when an install has already failed.
+esp_warn_free_mb = 256
+manager = "sdbootutil"
+multiversion_base = ["latest", "latest-1", "running"]
+
+[notify]
+# The URL lives in a root-only file, never in configuration and never in a
+# repository.
+webhook_file = "/etc/sluice/webhook"
+webhook_format = "discord"
+desktop = true
+
+[lineage]
+cache_ttl_hours = 6
+
+[component.kernel]
+policy = "hold-series"
+packages = "auto"
+anchor = "kernel-default"
+include_kmps = true
+series_regex = '^(\d+\.\d+)'
+promote_hint_min_point = 3
+warn_after_eol_days = 14
+lineage = "linux-stable"
+# Keep the default boot entry on the held kernel; sdbootutil resets it to the
+# newest installed kernel after every transaction.
+boot_entries = true
+
+[component.kernel.highlight]
+# The subsystems most likely to cause trouble on this kind of machine.
+amdgpu = 'drm/amd|amdgpu|amdkfd'
+drm    = 'drm/'
+pm     = 'cpuidle|cpufreq|PM:|suspend|resume'
+
+# Phase 2 — both still `follow` while the kernel gate settles. Tightening them
+# is one line each: `policy = "hold-series"` for Mesa, `policy = "soak"` for
+# the firmware.
+
+[component.mesa]
+policy = "follow"
+packages = "auto"
+anchor = "Mesa"
+# Mesa here is Mesa-26.2.2-2.1 plus Mesa-drivers-26.2.2-2.2 (Mesa-dri,
+# libvulkan_radeon, …); grouping by source keeps both, and drops Mesa-demo.
+family_sources = ["Mesa", "Mesa-drivers"]
+series_regex = '^(\d+\.\d+)'
+promote_hint_min_point = 2
+
+[component.amdgpu-firmware]
+policy = "follow"
+packages = ["kernel-firmware-amdgpu"]
+anchor = "kernel-firmware-amdgpu"
+# Date-versioned: there is no series to hold, so when this tightens it becomes
+# `soak`, not `hold-series`.
+soak_days = 7
+
+# On a GPU-heavy machine, kernel, Mesa and firmware tend to break together, so
+# they can be promoted and rolled back together: `sluice promote gpu`.
+[bundle.gpu]
+components = ["kernel", "mesa", "amdgpu-firmware"]

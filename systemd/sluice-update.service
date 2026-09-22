@@ -1,0 +1,18 @@
+[Unit]
+Description=sluice — apply the updates policy allows
+Documentation=https://github.com/max-bromberg/sluice
+After=network-online.target
+Wants=network-online.target
+# Never race the package manager.
+Conflicts=zypp-refresh.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sluice update
+TimeoutStartSec=2h
+
+# update installs packages, so it deliberately gets far fewer restrictions than
+# sluice-check.service. It still must not be killed mid-transaction.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30min

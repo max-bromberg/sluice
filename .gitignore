@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local, machine-specific overrides — never commit these.
+/sluice.local.toml
+/.sluice-dev/
+
+# Personal notes, the original spec and a real profile. Never published.
+/local/

@@ -1,0 +1,26 @@
+[Unit]
+Description=sluice — check for gated updates and problems
+Documentation=https://github.com/max-bromberg/sluice
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sluice check
+# `check` exits 1 when something needs attention. That is information, not a
+# failure, so the unit must not be marked failed for it.
+SuccessExitStatus=0 1
+
+# check changes no packages; it only reads state and records what it announced.
+# `full` rather than `strict`: zypper refreshes metadata into /var/cache/zypp
+# and takes its lock under /run, and desktop notifications are delivered over
+# /run/user/<uid>/bus. /usr, /boot and /etc stay read-only.
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

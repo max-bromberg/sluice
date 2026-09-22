@@ -1,0 +1,142 @@
+# sluice — example configuration
+#
+# Every value here is a default. Copy this file to /etc/sluice/config.toml and
+# change only what you need; anything you leave out keeps the built-in value.
+# `sluice show-config` prints the effective configuration including defaults.
+#
+# Config search order (first hit wins):
+#   $SLUICE_CONFIG
+#   ./sluice.toml
+#   $XDG_CONFIG_HOME/sluice/config.toml
+#   /etc/sluice/config.toml
+#
+# For a filled-in, real-world example see config/profiles/.
+
+[paths]
+state_dir = "/var/lib/sluice"
+cache_dir = "/var/cache/sluice"
+vault_dir = "/var/lib/sluice/vault"
+log_file  = "/var/log/sluice.log"
+
+[backend]
+# Only "zypper" is implemented. The seam exists so the policy engine can be
+# tested without a distribution, not to imply other backends work.
+kind = "zypper"
+refresh = true
+# How the TUI re-runs itself for a privileged action: "auto", "pkexec",
+# "sudo", or "none". "auto" prefers pkexec, which prompts through the desktop's
+# polkit agent instead of taking over the terminal.
+escalate_with = "auto"
+
+[boot]
+esp_path = "/boot/efi"
+# Warn below this much free space. Several kernels plus per-snapshot entries
+# fill a small ESP faster than you would expect.
+esp_warn_free_mb = 128
+# "auto" detects sdbootutil, then kernel-install. sluice never edits bootloader
+# configuration directly; it only reads state and calls `bootctl set-default`.
+manager = "auto"
+# Kept in multiversion.kernels alongside any pinned known-good versions, so
+# purge-kernels cannot remove your rollback target.
+multiversion_base = ["latest", "latest-1", "running"]
+# The package manager config file holding multiversion.kernels.
+package_manager_conf = "/etc/zypp/zypp.conf"
+
+[health]
+journalctl = "journalctl"
+pstore_dir = "/var/lib/systemd/pstore"
+# A boot whose journal tail matches any of these ended cleanly. Everything else
+# is recorded as an unclean end — which is the only durable trace a hard freeze
+# leaves. Override if your init logs something different.
+clean_end_patterns = [
+  'systemd-shutdown\[1\]:',
+  'Reached target (Shutdown|Power-Off|Power Off|Reboot|Halt|Final Step)',
+  'Shutting down\.',
+  'systemd\[1\]: Finished .*(Power-Off|Reboot|Halt)',
+]
+tail_lines = 400
+# Ignore boots shorter than this; they are usually installer or rescue sessions.
+min_boot_secs = 30
+
+[lineage]
+releases_url   = "https://www.kernel.org/releases.json"
+changelog_base = "https://cdn.kernel.org/pub/linux/kernel"
+# Series status comes from releases.json; the list of point releases and their
+# dates from the changelog_base directory index. (regzbot is not consulted: it
+# has no documented machine-readable endpoint.)
+cache_ttl_hours = 6
+# Show at most this many recent point releases per series; each is one
+# ChangeLog download the first time it is seen, cached for good after that.
+max_points = 12
+# Download a gated candidate's RPM (~100 MB for a kernel) to show the
+# distribution's own changelog. The file is reused when the version is vaulted.
+repo_changelog = false
+offline = false
+http_timeout_secs = 15
+
+[notify]
+# The webhook URL itself is never stored in config — only the path to a
+# root-only file containing it, so this file stays safe to publish.
+# webhook_file = "/etc/sluice/webhook"
+webhook_format = "discord"   # discord | slack | raw
+desktop = true
+
+# ---------------------------------------------------------------------------
+# Components
+# ---------------------------------------------------------------------------
+#
+# policy:
+#   follow       no gating; behaves like a plain distribution upgrade
+#   hold-series  auto-apply within the current MAJOR.MINOR; gate series changes
+#   soak         auto-apply once a candidate has sat unchanged for soak_days
+#   hold         never update automatically
+
+[component.kernel]
+policy = "hold-series"
+# "auto" derives the family from the installed set: the anchor, plus every
+# installed package in family_glob carrying the same version. Sharing a version
+# is what separates kernel-default-devel (family) from kernel-firmware-amdgpu
+# (date-versioned, not family) without a hardcoded exclusion list.
+packages = "auto"
+anchor = "kernel-default"
+# family_glob = "kernel*"     # derived from the anchor when unset
+include_kmps = true
+# Capture group 1 is the series key: 7.2.6 -> 7.2
+series_regex = '^(\d+\.\d+)'
+# Show a "looks mature" hint at or above this point release. A hint only —
+# sluice never promotes across a series on its own, under any circumstances.
+promote_hint_min_point = 3
+warn_after_eol_days = 14
+lineage = "linux-stable"     # linux-stable | none
+# This component has boot entries: sluice keeps the default entry on the
+# version it holds (the distribution resets it to the newest kernel after
+# every transaction) and pins known-good versions against purge-kernels.
+boot_entries = true
+
+# Regexes counted per changelog subject line and shown in the lineage view.
+# These encode what *you* care about regressing, so there is no useful default.
+# [component.kernel.highlight]
+# amdgpu = 'drm/amd|amdgpu|amdkfd'
+
+# [component.mesa]
+# policy = "hold-series"       # gate 26.2 -> 26.3
+# packages = "auto"
+# anchor = "Mesa"
+# Mesa is built from two source packages whose releases differ, and ships
+# libgbm1 and libvulkan_* alongside Mesa-*. Grouping by source finds all of it,
+# and leaves out Mesa-demo, which is a different upstream.
+# family_sources = ["Mesa", "Mesa-drivers"]
+
+# [component.amdgpu-firmware]
+# policy = "soak"
+# soak_days = 7
+# packages = ["kernel-firmware-amdgpu"]
+# anchor = "kernel-firmware-amdgpu"
+# Date-versioned packages have no meaningful series, so hold-series is wrong
+# for them; soak is the policy that fits.
+
+# A bundle is promoted, marked good and rolled back as one unit — for a GPU
+# stack whose kernel driver, userspace and firmware were tested together.
+# Members keep their own policies for everyday updates.
+# [bundle.gpu]
+# components = ["kernel", "mesa", "amdgpu-firmware"]

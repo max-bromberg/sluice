@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily sluice check
+Documentation=https://github.com/max-bromberg/sluice
+
+[Timer]
+OnCalendar=daily
+# Spread the load on kernel.org and avoid every machine waking at midnight.
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
