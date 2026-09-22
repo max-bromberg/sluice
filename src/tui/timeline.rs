@@ -855,6 +855,35 @@ impl TimelineView {
             bx += w;
         }
 
+        // A legend, so the glyphs can be learned by looking.
+        let legend: [(&str, &str, Style); 8] = [
+            ("▶", "running", Style::default().fg(AUTO)),
+            ("●", "installed", Style::default().fg(GOOD)),
+            ("★", "boots by default", Style::default().fg(STAR)),
+            ("✔", "known-good", Style::default().fg(GOOD)),
+            ("◆", "gated", Style::default().fg(GATED)),
+            ("◉", "offered", Style::default().fg(AUTO)),
+            ("◌", "expected", Style::default().fg(GHOST)),
+            ("✖", "unclean end", Style::default().fg(BAD)),
+        ];
+        let mut lx = inner.x + 1;
+        for (glyph, what, style) in legend {
+            let need = (glyph.chars().count() + what.chars().count() + 3) as u16;
+            if lx + need >= inner.x + inner.width {
+                break;
+            }
+            lx = put(buf, inner, lx, inner.y + 1, glyph, style);
+            lx = put(
+                buf,
+                inner,
+                lx + 1,
+                inner.y + 1,
+                what,
+                Style::default().fg(FAINT),
+            );
+            lx += 2;
+        }
+
         // Geometry.
         let label_w: u16 = self
             .rows

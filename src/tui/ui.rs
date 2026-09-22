@@ -117,6 +117,14 @@ fn draw_header(f: &mut Frame, area: Rect, d: &mut Dashboard) {
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "built-in defaults".into());
+    // Keep the end of a long path, which is the informative part.
+    let room = usize::from(area.width.saturating_sub(4));
+    let source = if source.chars().count() > room {
+        let tail: String = source.chars().rev().take(room.saturating_sub(1)).collect();
+        format!("…{}", tail.chars().rev().collect::<String>())
+    } else {
+        source
+    };
 
     let tabs = Tabs::new(Tab::ALL.iter().map(|t| t.title()).collect::<Vec<_>>())
         .select(d.tab.index())
