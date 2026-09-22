@@ -73,16 +73,23 @@ impl PackageBackend for MockBackend {
             .collect())
     }
 
-    fn installed_sources(
+    fn installed_details(
         &self,
         _r: &mut Runner,
-    ) -> Result<Vec<(String, crate::version::Evr, String)>> {
+        names: &[String],
+    ) -> Result<Vec<super::InstalledPkg>> {
         Ok(self
             .packages
             .borrow()
             .iter()
             .filter(|p| p.installed())
-            .filter_map(|p| Some((p.name.clone(), p.evr.clone(), p.source.clone()?)))
+            .filter(|p| names.is_empty() || names.contains(&p.name))
+            .map(|p| super::InstalledPkg {
+                name: p.name.clone(),
+                evr: p.evr.clone(),
+                source: p.source.clone(),
+                installed_at: None,
+            })
             .collect())
     }
 

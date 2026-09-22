@@ -107,7 +107,7 @@ series_regex = '^(\d+\.\d+)'
 # sluice never promotes across a series on its own, under any circumstances.
 promote_hint_min_point = 3
 warn_after_eol_days = 14
-lineage = "linux-stable"     # linux-stable | none
+lineage = "linux-stable"     # linux-stable | mesa | linux-firmware | index | none
 # This component has boot entries: sluice keeps the default entry on the
 # version it holds (the distribution resets it to the newest kernel after
 # every transaction) and pins known-good versions against purge-kernels.
@@ -126,12 +126,19 @@ boot_entries = true
 # libgbm1 and libvulkan_* alongside Mesa-*. Grouping by source finds all of it,
 # and leaves out Mesa-demo, which is a different upstream.
 # family_sources = ["Mesa", "Mesa-drivers"]
+# lineage = "mesa"             # release history from archive.mesa3d.org
 
 # [component.amdgpu-firmware]
 # policy = "soak"
 # soak_days = 7
 # packages = ["kernel-firmware-amdgpu"]
 # anchor = "kernel-firmware-amdgpu"
+# lineage = "linux-firmware"   # release history from kernel.org
+#
+# Anything else published as a directory of release tarballs:
+# lineage = "index"
+# lineage_url = "https://example.org/releases/"
+# lineage_pattern = 'foo-(\d+\.\d+\.\d+)\.tar\.xz'   # group 1 is the version
 # Date-versioned packages have no meaningful series, so hold-series is wrong
 # for them; soak is the policy that fits.
 

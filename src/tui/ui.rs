@@ -22,6 +22,7 @@ const BAD: Color = Color::Rgb(0xef, 0x44, 0x44);
 const GOOD: Color = Color::Rgb(0x22, 0xc5, 0x5e);
 const AUTO: Color = Color::Rgb(0x38, 0xbd, 0xf8);
 const MUTED: Color = Color::Rgb(0x94, 0xa3, 0xb8);
+const ACCENT: Color = Color::Rgb(0xa7, 0x8b, 0xfa);
 
 pub fn draw(f: &mut Frame, d: &mut Dashboard) {
     let chunks = Layout::default()
@@ -35,13 +36,28 @@ pub fn draw(f: &mut Frame, d: &mut Dashboard) {
 
     draw_header(f, chunks[0], d);
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Min(30)])
-        .split(chunks[1]);
-
-    draw_components(f, body[0], d);
-    draw_detail(f, body[1], d);
+    if d.tab == Tab::Lineage {
+        // The timeline is the whole canvas; j/k still switch what it shows.
+        d.list_area = Rect::default();
+        let name = d.selected_name().unwrap_or_default();
+        let area = chunks[1];
+        match d.active_timeline() {
+            Some(tl) => tl.render(area, f.buffer_mut(), &name),
+            None => f.render_widget(
+                Paragraph::new("select a component to see its timeline")
+                    .style(Style::default().fg(MUTED))
+                    .block(bordered("Timeline")),
+                area,
+            ),
+        }
+    } else {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(30), Constraint::Min(30)])
+            .split(chunks[1]);
+        draw_components(f, body[0], d);
+        draw_detail(f, body[1], d);
+    }
     draw_footer(f, chunks[2], d);
 
     match d.modal.clone() {
@@ -52,7 +68,7 @@ pub fn draw(f: &mut Frame, d: &mut Dashboard) {
     }
 }
 
-fn draw_header(f: &mut Frame, area: Rect, d: &Dashboard) {
+fn draw_header(f: &mut Frame, area: Rect, d: &mut Dashboard) {
     let mut spans = vec![
         Span::styled(
             "sluice",
@@ -72,24 +88,21 @@ fn draw_header(f: &mut Frame, area: Rect, d: &Dashboard) {
         spans.push(Span::raw("  "));
     }
 
-    let needs_attention = d
-        .status
-        .as_ref()
-        .map(|s| {
-            s.components
-                .iter()
-                .filter(|c| c.eval.decision.needs_attention())
-                .count()
-        })
-        .unwrap_or(0);
-
-    if needs_attention > 0 {
+    let chips = attention(d);
+    if chips.is_empty() && d.status.is_some() {
+        spans.push(Span::styled("✓ all clear", Style::default().fg(GOOD)));
+    }
+    for (i, (text, color)) in chips.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
         spans.push(Span::styled(
-            format!("{needs_attention} gated"),
-            Style::default().fg(GATED).add_modifier(Modifier::BOLD),
+            format!(" {text} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
         ));
-    } else if d.status.is_some() {
-        spans.push(Span::styled("all clear", Style::default().fg(GOOD)));
     }
 
     if let Some(loading) = &d.loading {
@@ -119,6 +132,51 @@ fn draw_header(f: &mut Frame, area: Rect, d: &Dashboard) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(tabs, inner);
+    d.tabs_area = inner;
+}
+
+/// Everything that deserves a glance, as short chips for the header.
+fn attention(d: &Dashboard) -> Vec<(String, Color)> {
+    let mut out = Vec::new();
+    let Some(status) = &d.status else {
+        return out;
+    };
+    let gated: Vec<&str> = status
+        .components
+        .iter()
+        .filter(|c| c.eval.gated.is_some())
+        .map(|c| c.eval.component.as_str())
+        .collect();
+    if !gated.is_empty() {
+        out.push((format!("◆ {} gated", gated.join(", ")), GATED));
+    }
+    if status.components.iter().any(|c| c.boot_drift.is_some()) {
+        out.push(("⚠ boot default moved".into(), BAD));
+    }
+    for c in &status.components {
+        if c.eval.series_withdrawn {
+            out.push((format!("! {} series withdrawn", c.eval.component), GATED));
+        }
+        if c.upstream_eol_days.is_some() {
+            out.push((format!("! {} EOL upstream", c.eval.component), BAD));
+        }
+    }
+    if let Some(esp) = status.esp.as_ref().filter(|_| status.esp_low) {
+        out.push((format!("⚠ ESP {} MB free", esp.free_mb), GATED));
+    }
+    let unprotected: Vec<&str> = status
+        .components
+        .iter()
+        .filter(|c| c.eval.policy != crate::config::Policy::Follow && c.known_good.is_none())
+        .map(|c| c.eval.component.as_str())
+        .collect();
+    if !unprotected.is_empty() {
+        out.push((
+            format!("no rollback target: {}", unprotected.join(", ")),
+            MUTED,
+        ));
+    }
+    out
 }
 
 fn draw_components(f: &mut Frame, area: Rect, d: &mut Dashboard) {
@@ -132,7 +190,7 @@ fn draw_components(f: &mut Frame, area: Rect, d: &mut Dashboard) {
         return;
     };
 
-    let items: Vec<ListItem> = status
+    let mut items: Vec<ListItem> = status
         .components
         .iter()
         .map(|c| {
@@ -167,6 +225,29 @@ fn draw_components(f: &mut Frame, area: Rect, d: &mut Dashboard) {
             ])
         })
         .collect();
+    for (name, b) in &d.app.config.bundles {
+        items.push(ListItem::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    "▣",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    name.clone(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("   "),
+                Span::styled(
+                    b.components.join(" · "),
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                ),
+            ]),
+        ]));
+    }
+    d.list_area = area;
 
     let mut list_state = ListState::default();
     list_state.select(Some(d.selected));
@@ -200,7 +281,7 @@ fn decision_marker(c: &ComponentStatus) -> (&'static str, Color) {
 fn draw_detail(f: &mut Frame, area: Rect, d: &mut Dashboard) {
     let text = match d.tab {
         Tab::Overview => overview_text(d),
-        Tab::Lineage => lineage_text(d),
+        Tab::Lineage => Text::default(),
         Tab::Health => health_text(d),
         Tab::Log => log_text(d),
     };
@@ -220,6 +301,11 @@ fn draw_detail(f: &mut Frame, area: Rect, d: &mut Dashboard) {
 }
 
 fn overview_text(d: &Dashboard) -> Text<'static> {
+    if let Some(bundle) = d.selected_bundle() {
+        let mut t = bundle_text(d, &bundle);
+        t.lines.extend(system_lines(d));
+        return t;
+    }
     let Some(c) = d.selected_component() else {
         return Text::from("no components configured");
     };
@@ -332,131 +418,139 @@ fn overview_text(d: &Dashboard) -> Text<'static> {
         format!("packages: {}", c.eval.family_names().join(", ")),
         Style::default().fg(MUTED),
     ));
+    lines.extend(system_lines(d));
 
     Text::from(lines)
 }
 
-fn lineage_text(d: &Dashboard) -> Text<'static> {
-    let Some(v) = &d.lineage else {
-        return Text::styled(
-            "press l to fetch the upstream lineage for this component",
-            Style::default().fg(MUTED),
-        );
-    };
-
-    let mut lines = Vec::new();
-    for series in [v.candidate.as_ref(), v.current.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        let (tag, color) = if series.is_current {
-            ("your series", MUTED)
-        } else if series.gated {
-            ("GATED", GATED)
-        } else {
-            ("requested", MUTED)
+fn bundle_text(d: &Dashboard, bundle: &str) -> Text<'static> {
+    let members = d
+        .app
+        .config
+        .bundles
+        .get(bundle)
+        .map(|b| b.components.clone())
+        .unwrap_or_default();
+    let mut lines = vec![
+        Line::styled(
+            "promoted, marked good and rolled back as one unit",
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        ),
+        Line::raw(""),
+    ];
+    for m in &members {
+        let Some(c) = d.component_status(m) else {
+            lines.push(Line::styled(
+                format!("{m:<16} not evaluated"),
+                Style::default().fg(MUTED),
+            ));
+            continue;
+        };
+        let (marker, color) = decision_marker(c);
+        let state = match c.lifecycle {
+            Lifecycle::Unvetted => ("unvetted", MUTED),
+            Lifecycle::KnownGood => ("known-good", GOOD),
+            Lifecycle::Testing => ("testing", GATED),
         };
         lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), Style::default().fg(color)),
             Span::styled(
-                series.series.clone(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                format!("{m:<16}"),
+                Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled(format!("({tag})"), Style::default().fg(color)),
-            Span::raw("  "),
-            Span::styled(
-                series
-                    .status
+            Span::raw(format!(
+                "{:<14}",
+                c.eval
+                    .installed
                     .as_ref()
-                    .map_or_else(|| "upstream unknown".into(), |s| s.describe()),
-                Style::default().fg(if series.status.as_ref().is_some_and(|s| s.eol) {
-                    BAD
-                } else {
-                    MUTED
-                }),
+                    .map_or_else(|| "—".into(), |v| v.to_string())
+            )),
+            Span::styled(format!("{:<12}", state.0), Style::default().fg(state.1)),
+            Span::styled(c.headline(), Style::default().fg(color)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    let hint = [
+        ("p", "promote together"),
+        ("m", "mark good together"),
+        ("b", "roll back together"),
+        ("2", "timeline of the stack"),
+    ];
+    let mut spans = Vec::new();
+    for (k, what) in hint {
+        spans.push(Span::styled(
+            format!(" {k} "),
+            Style::default().fg(Color::Black).bg(ACCENT),
+        ));
+        spans.push(Span::styled(
+            format!(" {what}   "),
+            Style::default().fg(MUTED),
+        ));
+    }
+    lines.push(Line::from(spans));
+    Text::from(lines)
+}
+
+/// The machine-wide facts, under every overview.
+fn system_lines(d: &Dashboard) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::raw(""),
+        Line::styled(
+            "system",
+            Style::default()
+                .fg(MUTED)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ),
+    ];
+    let Some(status) = &d.status else {
+        return lines;
+    };
+    if let Some(esp) = &status.esp {
+        let color = if status.esp_low { GATED } else { MUTED };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<14}", "ESP"), Style::default().fg(MUTED)),
+            Span::styled(
+                format!(
+                    "{} MB free of {} MB ({}% used) at {}",
+                    esp.free_mb,
+                    esp.total_mb,
+                    esp.used_percent(),
+                    esp.path.display()
+                ),
+                Style::default().fg(color),
             ),
         ]));
-        if let Some(d) = series.status.as_ref().and_then(|s| s.released) {
-            let days = (chrono::Utc::now().date_naive() - d).num_days();
-            lines.push(Line::styled(
-                format!("  mainline {d} ({days} days ago)"),
-                Style::default().fg(MUTED),
-            ));
-        }
-
-        if series.points.is_empty() {
-            lines.push(Line::styled(
-                "  no point releases yet",
-                Style::default().fg(MUTED),
-            ));
-        }
-        if series.omitted > 0 {
-            lines.push(Line::styled(
-                format!("  … {} earlier release(s) not shown", series.omitted),
-                Style::default().fg(MUTED),
-            ));
-        }
-
-        for p in &series.points {
-            let mut spans = vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("{:<9}", p.version),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    p.date
-                        .map_or_else(|| "          ".into(), |d| d.to_string()),
-                    Style::default().fg(MUTED),
-                ),
-                Span::raw("  "),
-                Span::raw(format!("{:>4} patches", p.patches)),
-            ];
-            for (label, count) in &p.highlights {
-                spans.push(Span::styled(
-                    format!("   {label}: {count:>3}"),
-                    Style::default().fg(if *count > 0 { AUTO } else { MUTED }),
-                ));
-            }
-            if p.reverts > 0 {
-                spans.push(Span::styled(
-                    format!("   reverts: {}", p.reverts),
-                    Style::default().fg(GATED),
-                ));
-            }
-            lines.push(Line::from(spans));
-        }
-
-        if let Some(hint) = &series.hint {
-            lines.push(Line::styled(
-                format!("  hint: {hint}"),
-                Style::default().fg(AUTO).add_modifier(Modifier::ITALIC),
-            ));
-        }
-        if let Some(note) = &series.repo_note {
-            lines.push(Line::styled(
-                format!("  {note}"),
-                Style::default().fg(MUTED),
-            ));
-        }
-        if series.withdrawn {
-            lines.push(Line::styled(
-                "  the repositories no longer ship this series — you are frozen here",
-                Style::default().fg(GATED),
-            ));
-        }
-        lines.push(Line::raw(""));
+        // A bar, because 82% reads faster as a shape than as a number.
+        let width = 30usize;
+        let used = (esp.used_percent() as usize * width / 100).min(width);
+        lines.push(Line::from(vec![
+            Span::raw(format!("{:<14}", "")),
+            Span::styled("█".repeat(used), Style::default().fg(color)),
+            Span::styled(
+                "░".repeat(width - used),
+                Style::default().fg(Color::Rgb(0x33, 0x41, 0x55)),
+            ),
+        ]));
     }
-
-    lines.push(Line::styled(v.freshness_note(), Style::default().fg(MUTED)));
-    for w in &v.warnings {
+    if let Some(id) = crate::boot::default_entry_from_efivars(&d.app.config.boot.efivars_dir) {
+        lines.push(kv("boot default", id));
+    }
+    if let Some(k) = &d.app.running_kernel {
+        lines.push(kv("running", k.clone()));
+    }
+    if status.vault_bytes > 0 {
+        lines.push(kv(
+            "vault",
+            format!("{:.1} MB", status.vault_bytes as f64 / 1_048_576.0),
+        ));
+    }
+    for w in &status.warnings {
         lines.push(Line::styled(
             format!("note: {w}"),
             Style::default().fg(MUTED),
         ));
     }
-
-    Text::from(lines)
+    lines
 }
 
 fn health_text(d: &Dashboard) -> Text<'static> {
@@ -521,24 +615,73 @@ fn health_text(d: &Dashboard) -> Text<'static> {
 }
 
 fn log_text(d: &Dashboard) -> Text<'static> {
+    let mut lines = vec![Line::styled(
+        "this session",
+        Style::default()
+            .fg(MUTED)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )];
     if d.log.is_empty() {
-        return Text::styled("nothing yet this session", Style::default().fg(MUTED));
+        lines.push(Line::styled("nothing yet", Style::default().fg(MUTED)));
     }
-    Text::from(
+    lines.extend(
         d.log
             .iter()
             .rev()
-            .map(|l| Line::styled(l.clone(), Style::default().fg(MUTED)))
-            .collect::<Vec<_>>(),
-    )
+            .map(|l| Line::styled(l.clone(), Style::default().fg(MUTED))),
+    );
+
+    // The durable record: every command sluice has run to change the system.
+    let path = &d.app.config.paths.log_file;
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("action log — {}", path.display()),
+        Style::default()
+            .fg(MUTED)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    ));
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let tail: Vec<&str> = text.lines().rev().take(60).collect();
+            if tail.is_empty() {
+                lines.push(Line::styled("empty", Style::default().fg(MUTED)));
+            }
+            for l in tail {
+                let color = if l.contains(" DRY-RUN ") {
+                    MUTED
+                } else if l.contains(" RUN ") {
+                    AUTO
+                } else {
+                    MUTED
+                };
+                lines.push(Line::styled(l.to_string(), Style::default().fg(color)));
+            }
+        }
+        Err(e) => lines.push(Line::styled(
+            format!("not readable: {e}"),
+            Style::default().fg(MUTED),
+        )),
+    }
+    Text::from(lines)
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, d: &Dashboard) {
     let keys: &[(&str, &str)] = match d.modal {
+        Modal::None if d.tab == Tab::Lineage => &[
+            ("j/k", "component"),
+            ("tab", "pane"),
+            ("r", "refresh"),
+            ("u", "update"),
+            ("p", "promote"),
+            ("m", "mark good"),
+            ("b", "roll back"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
         Modal::None => &[
             ("↑↓/jk", "select"),
             ("tab", "pane"),
-            ("l", "lineage"),
+            ("l", "timeline"),
             ("r", "refresh"),
             ("u", "update"),
             ("p", "promote"),
@@ -630,15 +773,25 @@ fn draw_output(f: &mut Frame, title: &str, body: &str, ok: bool) {
 }
 
 fn draw_help(f: &mut Frame) {
-    let area = centered(64, 70, f.area());
+    let area = centered(64, 90, f.area());
     f.render_widget(Clear, area);
 
     let rows = [
         ("↑ ↓ / j k", "select a component"),
         ("tab / shift-tab", "switch pane"),
         ("1 2 3 4", "jump to a pane"),
-        ("l", "fetch the upstream lineage for the selection"),
+        ("l", "open the timeline"),
         ("r", "re-read the system"),
+        ("mouse", "click to select, wheel to zoom, drag to pan"),
+        ("", ""),
+        ("timeline", ""),
+        ("  ← → / h l", "scrub release by release"),
+        ("  ↑ ↓", "move between series"),
+        ("  ⇧← ⇧→ / H L", "pan"),
+        ("  + −", "zoom in and out"),
+        ("  [ ]", "less / more information"),
+        ("  enter", "all the detail, and back"),
+        ("  c g t f", "current · gated · today · fit everything"),
         ("", ""),
         ("u", "update — apply what policy allows"),
         ("p", "promote — cross the series gate (explicit)"),

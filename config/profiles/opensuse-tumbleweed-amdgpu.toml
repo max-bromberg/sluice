@@ -76,6 +76,8 @@ anchor = "Mesa"
 # Mesa here is Mesa-26.2.2-2.1 plus Mesa-drivers-26.2.2-2.2 (Mesa-dri,
 # libvulkan_radeon, …); grouping by source keeps both, and drops Mesa-demo.
 family_sources = ["Mesa", "Mesa-drivers"]
+# Release history from the Mesa archive, with each release's notes.
+lineage = "mesa"
 series_regex = '^(\d+\.\d+)'
 promote_hint_min_point = 2
 
@@ -83,6 +85,7 @@ promote_hint_min_point = 2
 policy = "follow"
 packages = ["kernel-firmware-amdgpu"]
 anchor = "kernel-firmware-amdgpu"
+lineage = "linux-firmware"
 # Date-versioned: there is no series to hold, so when this tightens it becomes
 # `soak`, not `hold-series`.
 soak_days = 7

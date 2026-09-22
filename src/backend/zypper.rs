@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::{CmpOp, LockSpec, PackageBackend, Pkg, PkgStatus, Transaction};
+use super::{CmpOp, InstalledPkg, LockSpec, PackageBackend, Pkg, PkgStatus, Transaction};
 use crate::exec::{Cmd, Runner};
 use crate::version::Evr;
 
@@ -96,15 +96,21 @@ impl PackageBackend for Zypper {
         parse_solvables(&out.stdout)
     }
 
-    fn installed_sources(&self, r: &mut Runner) -> Result<Vec<(String, Evr, String)>> {
-        let out = r.run(
-            &Cmd::read("rpm")
-                .arg("-qa")
-                .arg("--qf")
-                .arg("%{NAME}\\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\\t%{SOURCERPM}\\n"),
-        )?;
-        out.require_ok("rpm -qa")?;
-        Ok(parse_sources(&out.stdout))
+    fn installed_details(&self, r: &mut Runner, names: &[String]) -> Result<Vec<InstalledPkg>> {
+        let query = if names.is_empty() {
+            Cmd::read("rpm").arg("-qa")
+        } else {
+            Cmd::read("rpm").arg("-q").args(names)
+        };
+        let out = r.run(&query.arg("--qf").arg(
+            "%{NAME}\\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\\t%{SOURCERPM}\\t%{INSTALLTIME}\\n",
+        ))?;
+        // `rpm -q` exits non-zero if any named package is missing, but still
+        // prints the ones that are installed.
+        if names.is_empty() {
+            out.require_ok("rpm -qa")?;
+        }
+        Ok(parse_installed(&out.stdout))
     }
 
     fn locks(&self, _r: &mut Runner) -> Result<Vec<LockSpec>> {
@@ -359,21 +365,33 @@ fn parse_solvables(xml: &str) -> Result<Vec<Pkg>> {
     Ok(out)
 }
 
-/// Parse `NAME\tEPOCH:VERSION-RELEASE\tSOURCERPM` lines. The source package
-/// name is the SOURCERPM file name without `-<version>-<release>.src.rpm`.
-fn parse_sources(text: &str) -> Vec<(String, Evr, String)> {
+/// Parse `NAME\tEPOCH:VERSION-RELEASE\tSOURCERPM\tINSTALLTIME` lines. The
+/// source package name is the SOURCERPM file name without
+/// `-<version>-<release>.src.rpm`.
+fn parse_installed(text: &str) -> Vec<InstalledPkg> {
     text.lines()
         .filter_map(|line| {
             let mut f = line.split('\t');
             let name = f.next()?.to_string();
             let evr = Evr::parse(f.next()?);
-            let srpm = f.next()?;
-            let stem = srpm
-                .strip_suffix(".src.rpm")
-                .or_else(|| srpm.strip_suffix(".nosrc.rpm"))?;
-            let mut parts = stem.rsplitn(3, '-');
-            let (_release, _version, source) = (parts.next()?, parts.next()?, parts.next()?);
-            Some((name, evr, source.to_string()))
+            let source = f.next().and_then(|srpm| {
+                let stem = srpm
+                    .strip_suffix(".src.rpm")
+                    .or_else(|| srpm.strip_suffix(".nosrc.rpm"))?;
+                let mut parts = stem.rsplitn(3, '-');
+                let (_release, _version) = (parts.next()?, parts.next()?);
+                parts.next().map(str::to_string)
+            });
+            let installed_at = f
+                .next()
+                .and_then(|t| t.trim().parse::<i64>().ok())
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0));
+            Some(InstalledPkg {
+                name,
+                evr,
+                source,
+                installed_at,
+            })
         })
         .collect()
 }
@@ -464,18 +482,26 @@ mod tests {
     /// sources at different releases, and Mesa-demo is not Mesa.
     #[test]
     fn parses_source_packages() {
-        let text = "Mesa\t0:26.2.2-2.1\tMesa-26.2.2-2.1.src.rpm\n\
-                    libvulkan_radeon\t0:26.2.2-2.2\tMesa-drivers-26.2.2-2.2.src.rpm\n\
-                    Mesa-demo-x\t0:9.0.0-7.5\tMesa-demo-9.0.0-7.5.src.rpm\n\
-                    kernel-default\t0:7.2.0-1.1\tkernel-default-7.2.0-1.1.nosrc.rpm\n\
-                    gpg-pubkey\t0:29b700a4-62b07e22\t(none)\n";
-        let sources = parse_sources(text);
-        assert_eq!(sources.len(), 4, "a package with no source RPM is skipped");
-        assert_eq!(sources[1].0, "libvulkan_radeon");
-        assert_eq!(sources[1].1.to_string(), "26.2.2-2.2");
-        assert_eq!(sources[1].2, "Mesa-drivers");
-        assert_eq!(sources[2].2, "Mesa-demo");
-        assert_eq!(sources[3].2, "kernel-default");
+        let text = "Mesa\t0:26.2.2-2.1\tMesa-26.2.2-2.1.src.rpm\t1758240701\n\
+                    libvulkan_radeon\t0:26.2.2-2.2\tMesa-drivers-26.2.2-2.2.src.rpm\t1758240701\n\
+                    Mesa-demo-x\t0:9.0.0-7.5\tMesa-demo-9.0.0-7.5.src.rpm\t1758240701\n\
+                    kernel-default\t0:7.2.0-1.1\tkernel-default-7.2.0-1.1.nosrc.rpm\t1756311145\n\
+                    gpg-pubkey\t0:29b700a4-62b07e22\t(none)\t1700000000\n";
+        let pkgs = parse_installed(text);
+        assert_eq!(pkgs.len(), 5);
+        assert_eq!(pkgs[1].name, "libvulkan_radeon");
+        assert_eq!(pkgs[1].evr.to_string(), "26.2.2-2.2");
+        assert_eq!(pkgs[1].source.as_deref(), Some("Mesa-drivers"));
+        assert_eq!(pkgs[2].source.as_deref(), Some("Mesa-demo"));
+        assert_eq!(pkgs[3].source.as_deref(), Some("kernel-default"));
+        assert_eq!(
+            pkgs[4].source, None,
+            "a package with no source RPM has no source"
+        );
+        assert_eq!(
+            pkgs[3].installed_at.unwrap().date_naive().to_string(),
+            "2025-08-27"
+        );
     }
 
     // Captured verbatim from `zypper --xmlout search -s --match-exact kernel-default`

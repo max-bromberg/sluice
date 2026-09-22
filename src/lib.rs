@@ -19,6 +19,7 @@
 //! - [`backend`] — the package-manager seam ([`backend::zypper`] is the real one).
 //! - [`gate`] — locks, and the guarantees that they are never left off.
 //! - [`lineage`] — upstream release history, cached and offline-capable.
+//! - [`timeline`] — every series laid out in time, with this machine overlaid.
 //! - [`health`] — boot evidence, including freezes that leave nothing in the log.
 //! - [`vault`] — kept RPMs, so a rollback target outlives the repository.
 
@@ -35,6 +36,7 @@ pub mod notify;
 pub mod policy;
 pub mod privilege;
 pub mod state;
+pub mod timeline;
 pub mod tui;
 pub mod vault;
 pub mod version;

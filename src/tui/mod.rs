@@ -9,13 +9,18 @@
 //! nothing is escalated that you have not seen written out.
 
 pub mod state;
+pub mod timeline;
 pub mod ui;
+pub mod worker;
 
 use std::io::{self, Stdout};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -53,24 +58,48 @@ pub fn run(config: Config, dry_run: bool) -> Result<i32> {
 fn enter() -> Result<Tui> {
     enable_raw_mode().context("entering raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("entering the alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .context("entering the alternate screen")?;
     Terminal::new(CrosstermBackend::new(stdout)).context("initialising the terminal")
 }
 
 fn leave(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
 
 fn event_loop(terminal: &mut Tui, d: &mut Dashboard) -> Result<()> {
     loop {
-        terminal.draw(|f| ui::draw(f, d))?;
+        d.pump();
+        let animating = if d.tab == Tab::Lineage {
+            d.ensure_timeline();
+            match d.active_timeline() {
+                Some(tl) => {
+                    tl.step();
+                    tl.animating()
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
 
-        // A poll rather than a blocking read, so a future background refresh
-        // can redraw without an input event to wake it.
-        if !event::poll(Duration::from_millis(250))? {
+        terminal.draw(|f| ui::draw(f, d))?;
+        // With the placeholder on screen, do the slow local reads.
+        if d.tab == Tab::Lineage {
+            d.read_machine();
+        }
+
+        // ~60 fps while something moves; otherwise slow enough to be idle but
+        // quick enough for the running marker to keep pulsing.
+        let wait = Duration::from_millis(if animating { 16 } else { 120 });
+        if !event::poll(wait)? {
             continue;
         }
 
@@ -78,12 +107,60 @@ fn event_loop(terminal: &mut Tui, d: &mut Dashboard) -> Result<()> {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 handle_key(terminal, d, key)?;
             }
+            Event::Mouse(m) => handle_mouse(d, m),
             Event::Resize(_, _) => {}
             _ => {}
         }
 
         if d.should_quit {
             return Ok(());
+        }
+    }
+}
+
+fn handle_mouse(d: &mut Dashboard, m: MouseEvent) {
+    if !matches!(d.modal, Modal::None) {
+        return;
+    }
+    let inside = |r: ratatui::layout::Rect| {
+        m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
+    };
+    if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+        // The tab bar: each title is its name plus a divider.
+        if inside(d.tabs_area) {
+            let mut x = d.tabs_area.x;
+            for t in Tab::ALL {
+                let w = t.title().chars().count() as u16 + 3;
+                if m.column < x + w {
+                    d.tab = t;
+                    d.scroll = 0;
+                    return;
+                }
+                x += w;
+            }
+            return;
+        }
+        // The component list: two lines per entry, inside a border.
+        if inside(d.list_area) && m.row > d.list_area.y {
+            let i = usize::from((m.row - d.list_area.y - 1) / 2);
+            if i < d.entries().len() {
+                d.selected = i;
+                d.scroll = 0;
+            }
+            return;
+        }
+    }
+    if d.tab == Tab::Lineage {
+        if let Some(tl) = d.active_timeline() {
+            tl.handle_mouse(m);
+            let info = tl.info;
+            d.info_level = info;
+        }
+    } else {
+        match m.kind {
+            MouseEventKind::ScrollDown => d.scroll = d.scroll.saturating_add(3),
+            MouseEventKind::ScrollUp => d.scroll = d.scroll.saturating_sub(3),
+            _ => {}
         }
     }
 }
@@ -119,45 +196,78 @@ fn handle_key(terminal: &mut Tui, d: &mut Dashboard, key: KeyEvent) -> Result<()
         Modal::None => {}
     }
 
+    // Keys that mean the same everywhere.
     match key.code {
-        KeyCode::Char('q') => d.should_quit = true,
-        KeyCode::Char('?') => d.modal = Modal::Help,
-
-        KeyCode::Down | KeyCode::Char('j') => d.select_next(),
-        KeyCode::Up | KeyCode::Char('k') => d.select_prev(),
-
+        KeyCode::Char('q') => {
+            d.should_quit = true;
+            return Ok(());
+        }
+        KeyCode::Char('?') => {
+            d.modal = Modal::Help;
+            return Ok(());
+        }
+        KeyCode::Char('j') => {
+            d.select_next();
+            return Ok(());
+        }
+        KeyCode::Char('k') => {
+            d.select_prev();
+            return Ok(());
+        }
         KeyCode::Tab => {
             d.tab = d.tab.next();
             d.scroll = 0;
+            return Ok(());
         }
         KeyCode::BackTab => {
             d.tab = d.tab.prev();
             d.scroll = 0;
+            return Ok(());
         }
         KeyCode::Char(c @ '1'..='4') => {
             d.tab = Tab::ALL[(c as u8 - b'1') as usize];
             d.scroll = 0;
+            return Ok(());
         }
+        KeyCode::Char('r') => {
+            d.refresh();
+            return Ok(());
+        }
+        KeyCode::Char('u') => {
+            propose(d, Verb::Update);
+            return Ok(());
+        }
+        KeyCode::Char('p') => {
+            propose(d, Verb::Promote);
+            return Ok(());
+        }
+        KeyCode::Char('m') => {
+            propose(d, Verb::MarkGood);
+            return Ok(());
+        }
+        KeyCode::Char('b') => {
+            propose(d, Verb::Rollback);
+            return Ok(());
+        }
+        _ => {}
+    }
 
+    if d.tab == Tab::Lineage {
+        if let Some(tl) = d.active_timeline() {
+            tl.handle_key(key);
+            let info = tl.info;
+            d.info_level = info;
+        }
+        return Ok(());
+    }
+
+    match key.code {
+        KeyCode::Down => d.select_next(),
+        KeyCode::Up => d.select_prev(),
         KeyCode::PageDown => d.scroll = d.scroll.saturating_add(10),
         KeyCode::PageUp => d.scroll = d.scroll.saturating_sub(10),
         KeyCode::Home => d.scroll = 0,
-
-        KeyCode::Char('l') => {
-            d.tab = Tab::Lineage;
-            // Drawn once first, so the "fetching…" note is on screen while the
-            // network call blocks rather than appearing after it returns.
-            terminal.draw(|f| ui::draw(f, d))?;
-            d.ensure_lineage();
-        }
-
-        KeyCode::Char('r') => d.refresh(),
-
-        KeyCode::Char('u') => propose(d, Verb::Update),
-        KeyCode::Char('p') => propose(d, Verb::Promote),
-        KeyCode::Char('m') => propose(d, Verb::MarkGood),
-        KeyCode::Char('b') => propose(d, Verb::Rollback),
-
+        KeyCode::Char('l') | KeyCode::Enter => d.tab = Tab::Lineage,
         _ => {}
     }
     Ok(())

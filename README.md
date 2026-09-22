@@ -24,20 +24,19 @@ sluice separates the two:
   crosses a feature boundary on its own, under any circumstances.
 
 ```
-sluice  ◆ 1 gated                                    /etc/sluice/config.toml
- Overview │ Lineage │ Health │ Log
-
- Components            kernel — Overview
- ◆ kernel              installed     7.2.6-1.1
-   7.2.6  hold-series  series        7.2
- • mesa                policy        hold-series
-   26.2.2  follow      state         known-good
-
-                       ◆ GATED: 7.3 available (7.3.3-1.1)
-
-                       rollback to   7.0.12-1.1  (vaulted)
-                       upstream      EOL upstream (last: 7.2.6)
-                       boots         6 boots, 141 h uptime, 0 unclean ends
+╭ kernel  timeline ──────────────────────── [−] 8d/10col [+]  [◂ less] ●●●○ [more ▸]  [fit] [today] ╮
+│                 Aug                     Sep                  today        Oct                    │
+│ 7.3                        ┄┄┄⋄┄┄┄┄⋄┄┄┄┄⋄┄┄┄┄◇┄┄│┄┄◌┄┄┄┄┄┄┄┄┄┄┄┄◇                         │
+│                               rc1  rc2  rc3  rc4 │  rc5?          7.3?                       │
+│▸7.2                        ▶━━━━━○○━━○━━○━━○━◉━━○│┄◌                                         │
+│                            ★7.2  7.2.1  7.2.4 7.2.6 7.2.8?                                    │
+│ 7.1   ─○───○───○───○──○──○──○──○┤EOL             │                                         │
+│ boots ▂▂✖▂▂▂▂▂▂▂▂✖▂▂   ▂▂▂▼▂▂▂▂▂▂▂✖▂▂▂ ▂▂▂▂▂▂ ▂✖                                           │
+│────────────────────────────────────────────────────────────────────────────────────────────│
+│ ○ kernel 7.2.5   point release · 11 days ago                                                │
+│ 558 changes · 3 reverts · touches this machine: amdgpu 30 · nvme 2 · kvm_amd 16              │
+│   • drm/amdkfd: Reject zero-sized AQL queue allocations after size halving                  │
+╰────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 ## Status
@@ -88,6 +87,43 @@ a single action, showing you the exact argv before it runs.
 
 Every command that changes anything takes `--dry-run`, which needs no root: it
 evaluates, and prints what it would lock, install and pin.
+
+## The dashboard
+
+Bare `sluice` opens it. The header carries whatever deserves a glance — a gated
+series, a boot default that has moved, a nearly full ESP, a component with no
+rollback target — and the overview ends with the machine: ESP use, the default
+boot entry, the running kernel.
+
+The **timeline** (`2`, or `l`) is the centre of it. Every series of a tracked
+package is a lane in time; this machine is drawn on top of it:
+
+| | |
+|---|---|
+| `▶` | the version running now (it pulses) |
+| `●` | installed |
+| `★` `✔` `⚗` | boots by default · known-good · under test |
+| `◆` | gated, waiting for your decision |
+| `◉` | offered by your repositories, not installed yet |
+| `◌` `◇` | releases not out yet, placed by their cadence — always a guess, and drawn as one |
+| `▂` `✖` | your boots, and the ones that ended without a shutdown |
+
+Scrub release by release with `←` `→`, move between series with `↑` `↓`, pan
+with `⇧←` `⇧→` or by dragging, and zoom from days to years with `+` `−` or the
+wheel. `[` and `]` (or the buttons) choose how much to show: at the top level
+each release carries a bar for how much changed, coloured by how much of that
+touches this machine, and the card below lists the changes that do.
+
+"This machine" is worked out, not configured: the drivers actually bound to its
+devices (read from sysfs), the modules they rely on, and its mounted
+filesystems. A fix to `amdgpu`, `mt7925` or `btrfs` counts; a fix to another
+vendor's chip that shares a library does not.
+
+Kernel history comes from kernel.org, Mesa's from its release archive and notes,
+firmware's from the linux-firmware tarball directory; anything else published as
+a directory of release tarballs works with `lineage = "index"`. Bundles get one
+canvas for the whole stack. Fetching happens off the UI thread, and everything
+is cached, so the timeline works offline.
 
 ## How it decides
 

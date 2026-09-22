@@ -33,7 +33,7 @@ pub struct Pkg {
     pub repo: String,
     pub status: PkgStatus,
     /// The source package it was built from (`Mesa-drivers`), where known.
-    /// Only installed packages carry it; see [`PackageBackend::installed_sources`].
+    /// Only installed packages carry it; see [`PackageBackend::installed_details`].
     #[serde(default)]
     pub source: Option<String>,
 }
@@ -130,6 +130,16 @@ impl LockSpec {
     }
 }
 
+/// An installed package, as the package database records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPkg {
+    pub name: String,
+    pub evr: Evr,
+    /// Source package name (`Mesa-drivers`), when known.
+    pub source: Option<String>,
+    pub installed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// The outcome of a transaction, as reported back to the caller.
 #[derive(Debug, Clone, Default)]
 pub struct Transaction {
@@ -162,10 +172,12 @@ pub trait PackageBackend {
         Ok(out)
     }
 
-    /// `(name, version, source package name)` for every installed package.
-    /// This is what groups subpackages built from the same sources, such as
+    /// Every installed package with its source package and install time.
+    /// The source is what groups subpackages built together, such as
     /// `libvulkan_radeon` with `Mesa-dri`, whatever their names.
-    fn installed_sources(&self, r: &mut Runner) -> Result<Vec<(String, Evr, String)>>;
+    ///
+    /// `names` limits the query to those packages; empty means all of them.
+    fn installed_details(&self, r: &mut Runner, names: &[String]) -> Result<Vec<InstalledPkg>>;
 
     /// Installed packages matching `pattern`.
     fn installed(&self, r: &mut Runner, pattern: &str) -> Result<Vec<Pkg>> {
@@ -226,8 +238,8 @@ impl<T: PackageBackend + ?Sized> PackageBackend for std::rc::Rc<T> {
     fn query_many(&self, r: &mut Runner, patterns: &[String]) -> Result<Vec<Pkg>> {
         (**self).query_many(r, patterns)
     }
-    fn installed_sources(&self, r: &mut Runner) -> Result<Vec<(String, Evr, String)>> {
-        (**self).installed_sources(r)
+    fn installed_details(&self, r: &mut Runner, names: &[String]) -> Result<Vec<InstalledPkg>> {
+        (**self).installed_details(r, names)
     }
     fn locks(&self, r: &mut Runner) -> Result<Vec<LockSpec>> {
         (**self).locks(r)

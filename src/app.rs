@@ -205,10 +205,15 @@ impl App {
         let sources = if cfg.family_sources.is_empty() {
             Vec::new()
         } else {
-            let all = self.backend.installed_sources(&mut self.runner)?;
+            let all = self.backend.installed_details(&mut self.runner, &[])?;
             all.into_iter()
-                .filter(|(_, _, src)| cfg.family_sources.contains(src))
-                .collect()
+                .filter_map(|p| {
+                    let src = p.source?;
+                    cfg.family_sources
+                        .contains(&src)
+                        .then_some((p.name, p.evr, src))
+                })
+                .collect::<Vec<_>>()
         };
         patterns.extend(sources.iter().map(|(name, _, _)| name.clone()));
         patterns.sort();
@@ -276,7 +281,7 @@ impl App {
                 self.config
                     .components
                     .get(&e.component)
-                    .is_some_and(|c| c.lineage != crate::config::LineageSource::None)
+                    .is_some_and(|c| c.lineage == crate::config::LineageSource::LinuxStable)
             })
             .collect();
         if !wants_upstream.is_empty() {
@@ -1226,6 +1231,156 @@ impl App {
             steps,
             note,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // timeline
+    // -----------------------------------------------------------------------
+
+    /// This machine's side of a component's timeline: which versions are
+    /// installed and since when, which one is running, which one boots by
+    /// default, what is known-good, under test, gated or vaulted, and — for a
+    /// kernel — every boot and how it ended.
+    pub fn machine(
+        &mut self,
+        component: &str,
+        health: Option<&HealthReport>,
+        now: DateTime<Utc>,
+    ) -> Result<crate::timeline::Machine> {
+        let (_, eval) = self.eval_of(component, now)?;
+        self.machine_for(&eval, health)
+    }
+
+    /// [`machine`](Self::machine) for an evaluation already in hand, which
+    /// saves re-querying every component.
+    pub fn machine_for(
+        &mut self,
+        eval: &Evaluation,
+        health: Option<&HealthReport>,
+    ) -> Result<crate::timeline::Machine> {
+        use crate::timeline::{normalize, BootSpan, Machine};
+
+        let component = eval.component.as_str();
+        let cfg = self.config.component(component)?.clone();
+        let (installed, available) = self.packages(&cfg)?;
+        let anchor = cfg
+            .anchor
+            .clone()
+            .or_else(|| eval.family.first().map(|p| p.name.clone()));
+        let details = self
+            .backend
+            .installed_details(
+                &mut self.runner,
+                &anchor.iter().cloned().collect::<Vec<_>>(),
+            )
+            .unwrap_or_default();
+        let cstate = self.state.component(component);
+        let default_id = cfg
+            .boot_entries
+            .then(|| boot::default_entry_from_efivars(&self.config.boot.efivars_dir))
+            .flatten();
+
+        let mut m = Machine {
+            series: eval.series.clone(),
+            ..Default::default()
+        };
+        let is_anchor = |p: &Pkg| Some(&p.name) == anchor.as_ref();
+
+        for p in installed.iter().filter(|p| is_anchor(p)) {
+            let marks = m.marks.entry(normalize(&p.evr.version)).or_default();
+            marks.installed = true;
+            marks.installed_at = details
+                .iter()
+                .find(|d| d.name == p.name && d.evr == p.evr)
+                .and_then(|d| d.installed_at)
+                .map(|t| t.date_naive());
+            if cfg.boot_entries {
+                marks.running |= self
+                    .running_kernel
+                    .as_deref()
+                    .is_some_and(|k| boot::kernel_release_matches(k, &p.evr));
+                marks.default_boot |= default_id
+                    .as_deref()
+                    .is_some_and(|id| boot::entry_id_boots(id, &p.evr));
+            } else {
+                // Userspace has one version installed, and that is what runs.
+                marks.running = true;
+            }
+        }
+        for p in available.iter().filter(|p| is_anchor(p) && p.offered()) {
+            m.marks
+                .entry(normalize(&p.evr.version))
+                .or_default()
+                .offered = true;
+        }
+        let mut set = |v: &Evr, f: fn(&mut crate::timeline::VersionMarks)| {
+            f(m.marks.entry(normalize(&v.version)).or_default());
+        };
+        if let Some(v) = &eval.installed {
+            set(v, |x| x.current = true);
+        }
+        if let Some(v) = &cstate.known_good {
+            set(v, |x| x.known_good = true);
+        }
+        if let Some(v) = &cstate.testing {
+            set(v, |x| x.testing = true);
+        }
+        if let Some((_, v)) = eval.gated_series() {
+            set(v, |x| x.gated = true);
+        }
+        for v in &cstate.vault {
+            set(&v.version, |x| x.vaulted = true);
+        }
+
+        if cfg.boot_entries {
+            if let Some(h) = health {
+                m.boots = h
+                    .boots
+                    .iter()
+                    .map(|b| BootSpan {
+                        start: b.start,
+                        end: b.end,
+                        clean: b.clean_end,
+                        kernel: b.kernel.clone(),
+                        pstore_hits: b.pstore_hits,
+                    })
+                    .collect();
+            }
+        }
+        Ok(m)
+    }
+
+    /// Series a component's timeline must show whatever their age: the ones
+    /// this machine has installed, holds, or is offered.
+    pub fn timeline_keep(
+        &mut self,
+        component: &str,
+        now: DateTime<Utc>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let (_, eval) = self.eval_of(component, now)?;
+        let machine = self.machine_for(&eval, None)?;
+        self.timeline_keep_for(&eval, &machine)
+    }
+
+    /// [`timeline_keep`](Self::timeline_keep) from data already in hand.
+    pub fn timeline_keep_for(
+        &self,
+        eval: &Evaluation,
+        machine: &crate::timeline::Machine,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let cfg = self.config.component(&eval.component)?;
+        let re = series_regex(&cfg.series_regex)?;
+        let cstate = self.state.component(&eval.component);
+        let mut keep: std::collections::BTreeSet<String> = machine
+            .marks
+            .iter()
+            .filter(|(_, m)| m.installed)
+            .filter_map(|(v, _)| Evr::parse(v).series(&re))
+            .collect();
+        keep.extend(eval.series.clone());
+        keep.extend(cstate.known_good.as_ref().and_then(|v| v.series(&re)));
+        keep.extend(eval.gated_series().map(|(s, _)| s.to_string()));
+        Ok(keep)
     }
 
     // -----------------------------------------------------------------------

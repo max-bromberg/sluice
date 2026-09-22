@@ -77,6 +77,13 @@ pub enum LineageSource {
     None,
     /// kernel.org releases.json plus per-release ChangeLogs.
     LinuxStable,
+    /// The Mesa release archive plus per-release notes.
+    Mesa,
+    /// The linux-firmware tarball directory on kernel.org.
+    LinuxFirmware,
+    /// Any web directory of release tarballs: set `lineage_url` and
+    /// `lineage_pattern` (capture group 1 is the version).
+    Index,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +119,10 @@ pub struct ComponentConfig {
     /// Empty by default — these encode what *you* care about regressing.
     pub highlight: BTreeMap<String, String>,
     pub lineage: LineageSource,
+    /// Overrides the index URL of `mesa`/`linux-firmware`, or sets it for `index`.
+    pub lineage_url: Option<String>,
+    /// Regex matching release file names in the index; group 1 is the version.
+    pub lineage_pattern: Option<String>,
     /// This component has boot entries (a kernel). sluice then keeps the
     /// default boot entry on the version it is holding, re-asserting it after
     /// every transaction, since the distribution's hooks reset it to the
@@ -134,6 +145,8 @@ impl Default for ComponentConfig {
             soak_days: 7,
             highlight: BTreeMap::new(),
             lineage: LineageSource::None,
+            lineage_url: None,
+            lineage_pattern: None,
             boot_entries: false,
         }
     }
@@ -405,6 +418,21 @@ impl Config {
                 regex::Regex::new(pattern).with_context(|| {
                     format!("component `{name}`: invalid highlight regex `{label}`")
                 })?;
+            }
+            if let Some(p) = &c.lineage_pattern {
+                let re = regex::Regex::new(p)
+                    .with_context(|| format!("component `{name}`: invalid lineage_pattern"))?;
+                anyhow::ensure!(
+                    re.captures_len() >= 2,
+                    "component `{name}`: lineage_pattern needs a capture group for the version"
+                );
+            }
+            if c.lineage == LineageSource::Index
+                && (c.lineage_url.is_none() || c.lineage_pattern.is_none())
+            {
+                anyhow::bail!(
+                    "component `{name}`: `lineage = \"index\"` needs lineage_url and lineage_pattern"
+                );
             }
             if c.packages.is_auto() && c.anchor.is_none() {
                 anyhow::bail!(
