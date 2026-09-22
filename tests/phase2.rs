@@ -67,6 +67,9 @@ impl Fixture {
         config.boot.efivars_dir = root.join("efivars");
         config.lineage.offline = true;
         config.notify.desktop = false;
+        // Hermetic: never read the host's journal. `true` prints nothing,
+        // which reads as an empty boot list.
+        config.health.journalctl = "true".into();
         config.backend.refresh = false;
         std::fs::write(
             &config.boot.package_manager_conf,

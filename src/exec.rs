@@ -234,13 +234,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("sluice.log");
         let mut r = Runner::new(true, Some(log.clone()));
+        // Mutating commands are not executed under dry run; the read-only one
+        // is, so it must exist everywhere the tests run.
         r.run(&Cmd::mutate("zypper").arg("dup")).unwrap();
-        r.run(&Cmd::read("zypper").arg("locks")).unwrap();
+        r.run(&Cmd::read("true").arg("--read-only-marker")).unwrap();
 
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("DRY-RUN zypper dup"));
         assert!(
-            !text.contains("zypper locks"),
+            !text.contains("--read-only-marker"),
             "read-only commands are not audited"
         );
     }
