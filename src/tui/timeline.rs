@@ -2244,12 +2244,16 @@ mod tests {
 
     fn render(v: &mut TimelineView) -> String {
         let area = Rect::new(0, 0, 120, 30);
-        let mut buf = Buffer::empty(area);
         // Skip the intro so everything is drawn.
         v.born = Instant::now() - std::time::Duration::from_secs(5);
+        // As the app does: draw once so the plot has its real width, frame
+        // the selection against it, let the easing settle, then draw.
+        v.render(area, &mut Buffer::empty(area), "kernel");
+        v.fit_around_selection();
         for _ in 0..60 {
             v.step();
         }
+        let mut buf = Buffer::empty(area);
         v.render(area, &mut buf, "kernel");
         (0..area.height)
             .map(|y| {
