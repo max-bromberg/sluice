@@ -90,14 +90,20 @@ fn api_url(cfg: &SelfUpdateConfig) -> String {
         .unwrap_or_else(|| format!("https://api.github.com/repos/{}/releases/latest", cfg.repo))
 }
 
-/// The latest release, through the lineage cache so a daily check and a
-/// dashboard refresh do not each spend an API request.
+/// The latest release. Background checks go through the lineage cache, so a
+/// daily check and a dashboard refresh do not each spend an API request;
+/// `fresh` asks GitHub now, for when you have explicitly asked.
 pub fn latest(
     cfg: &SelfUpdateConfig,
     lineage: &LineageConfig,
     cache_dir: &Path,
+    fresh: bool,
 ) -> Result<Release> {
-    let mut fetcher = crate::lineage::Fetcher::new(lineage, cache_dir);
+    let lineage = LineageConfig {
+        cache_ttl_hours: if fresh { 0 } else { lineage.cache_ttl_hours },
+        ..lineage.clone()
+    };
+    let mut fetcher = crate::lineage::Fetcher::new(&lineage, cache_dir);
     let url = api_url(cfg);
     let Some(body) = fetcher.get(&url) else {
         if fetcher.warnings.iter().any(|w| w.contains("404")) {
@@ -124,7 +130,7 @@ pub fn available(
     if !cfg.check || lineage.offline {
         return None;
     }
-    latest(cfg, lineage, cache_dir)
+    latest(cfg, lineage, cache_dir, false)
         .ok()
         .filter(|r| r.is_newer_than(CURRENT))
 }
@@ -341,7 +347,7 @@ mod tests {
             ..Default::default()
         };
         let lineage = LineageConfig::default();
-        let release = latest(&cfg, &lineage, dir.path()).unwrap();
+        let release = latest(&cfg, &lineage, dir.path(), true).unwrap();
         assert!(release.is_newer_than(CURRENT));
         assert!(available(&cfg, &lineage, dir.path()).is_some());
 

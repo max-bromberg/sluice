@@ -983,6 +983,7 @@ fn self_update(
         &app.config.self_update,
         &app.config.lineage,
         &app.config.paths.cache_dir,
+        true,
     )?;
     if !release.is_newer_than(CURRENT) {
         println!(
