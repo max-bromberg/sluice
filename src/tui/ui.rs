@@ -825,6 +825,20 @@ fn draw_remove(f: &mut Frame, picker: &super::state::RemovePicker) {
         ),
         Line::raw(""),
     ];
+    // First, so a short terminal cannot clip it: without the boot entries,
+    // the kernels older snapshots still hold on the ESP are not listed.
+    let unread = picker.plan.cleans_entries && !picker.plan.entries_read;
+    if unread {
+        lines.push(Line::from(vec![
+            Span::styled(" s ", Style::default().fg(Color::Black).bg(GATED)),
+            Span::styled(
+                " read every snapshot's boot entries (asks for your password) — older snapshots \
+                 may hold uninstalled kernels on the ESP",
+                Style::default().fg(GATED),
+            ),
+        ]));
+        lines.push(Line::raw(""));
+    }
     let width = picker
         .plan
         .versions
@@ -893,24 +907,10 @@ fn draw_remove(f: &mut Frame, picker: &super::state::RemovePicker) {
             Style::default().fg(if low { GATED } else { MUTED }),
         ));
     }
-    if picker.plan.cleans_entries && !picker.plan.entries_read {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "older snapshots may still hold kernels that are no longer installed on the ESP;",
-            Style::default().fg(GATED),
-        ));
-        lines.push(Line::from(vec![
-            Span::styled(" s ", Style::default().fg(Color::Black).bg(GATED)),
-            Span::styled(
-                " read every snapshot's boot entries to list them (asks for your password)",
-                Style::default().fg(GATED),
-            ),
-        ]));
-    }
     if picker.plan.removable().next().is_none() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            if picker.plan.cleans_entries && !picker.plan.entries_read {
+            if unread {
                 "nothing installed can be removed"
             } else {
                 "nothing can be removed"
@@ -930,7 +930,11 @@ fn draw_remove(f: &mut Frame, picker: &super::state::RemovePicker) {
                 ))
                 .title_bottom(
                     Line::from(Span::styled(
-                        " space choose · a all · enter continue · esc cancel ",
+                        if unread {
+                            " space choose · a all · s read snapshots · enter continue · esc cancel "
+                        } else {
+                            " space choose · a all · enter continue · esc cancel "
+                        },
                         Style::default().fg(MUTED),
                     ))
                     .alignment(Alignment::Center),

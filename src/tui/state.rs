@@ -593,10 +593,37 @@ impl Dashboard {
 
     /// Open the picker for removing installed versions of the selection.
     pub fn open_remove(&mut self) {
-        let Some(component) = self.removal_target() else {
+        let Some(mut component) = self.removal_target() else {
             self.note("nothing to remove for the selected entry");
             return;
         };
+        // Making room on the ESP is what this is for. A component with no
+        // boot entries and a single version has nothing to offer, so go to
+        // the kernel rather than to an empty picker.
+        let boot = |c: &str| {
+            self.app
+                .config
+                .components
+                .get(c)
+                .is_some_and(|c| c.boot_entries)
+        };
+        if !boot(&component) {
+            let single = self
+                .app
+                .removal_plan(&component)
+                .is_ok_and(|p| p.removable().next().is_none());
+            let kernel = self
+                .app
+                .config
+                .components
+                .iter()
+                .find(|(_, c)| c.boot_entries)
+                .map(|(n, _)| n.clone());
+            if let (true, Some(k)) = (single, kernel) {
+                self.note(format!("{component} has nothing to remove; showing {k}"));
+                component = k;
+            }
+        }
         match self.app.removal_plan(&component) {
             Ok(plan) if plan.versions.is_empty() => {
                 self.note(format!("{component}: nothing is installed"));

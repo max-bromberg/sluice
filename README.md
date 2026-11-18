@@ -321,7 +321,7 @@ default. After a rollback that keeps 7.3 installed, any `zypper in` would
 quietly make 7.3 the default again. So for components with `boot_entries =
 true`, sluice keeps the default on the version it is holding: it re-asserts it
 after every transaction it runs, `status` and `check` read the
-`LoaderEntryDefault` EFI variable (no root needed) and warn if something else
+`LoaderEntryPreferred` (systemd 262) or `LoaderEntryDefault` EFI variable (no root needed) and warn if something else
 moved it, and `sluice repair` puts it back. Entries exist per kernel *per
 snapshot*; sluice only ever picks the entry in the snapshot you are booting.
 

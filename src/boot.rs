@@ -150,7 +150,7 @@ pub fn kernel_release_matches(release: &str, evr: &Evr) -> bool {
 
 /// Whether a boot entry id (`opensuse-tumbleweed-7.2.0-1-default-1.conf`)
 /// boots the package version `evr`. Used where only the id is known, as with
-/// the `LoaderEntryDefault` EFI variable.
+/// the default entry's EFI variable (see [`default_entry_from_efivars`]).
 pub fn entry_id_boots(id: &str, evr: &Evr) -> bool {
     let rel_major = evr.release.split('.').next().unwrap_or("");
     let needle = format!("-{}-{rel_major}-", evr.version);
@@ -198,13 +198,24 @@ pub fn pick_entry<'a>(entries: &'a [BootEntry], version: &Evr) -> Option<&'a Boo
     (matching.len() == 1).then(|| matching[0])
 }
 
-/// The default entry id, read from the `LoaderEntryDefault` EFI variable.
+/// The default entry id, read from the boot loader's EFI variables.
 ///
 /// Unlike `bootctl list`, this needs no privileges, so an unprivileged
 /// `status` or `check` can still notice that the default has drifted.
+///
+/// systemd-boot 262 keeps the default `bootctl set-default` chose in
+/// `LoaderEntryPreferred`, and no `LoaderEntryDefault` exists there; older
+/// versions use `LoaderEntryDefault`. The newer name is read first.
 pub fn default_entry_from_efivars(efivars_dir: &Path) -> Option<String> {
+    ["LoaderEntryPreferred", "LoaderEntryDefault"]
+        .iter()
+        .find_map(|name| read_loader_string(efivars_dir, name))
+}
+
+/// A string EFI variable under the boot loader's vendor GUID.
+fn read_loader_string(efivars_dir: &Path, name: &str) -> Option<String> {
     const LOADER_GUID: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
-    let raw = std::fs::read(efivars_dir.join(format!("LoaderEntryDefault-{LOADER_GUID}"))).ok()?;
+    let raw = std::fs::read(efivars_dir.join(format!("{name}-{LOADER_GUID}"))).ok()?;
     // Four bytes of attributes, then UTF-16LE with a trailing NUL.
     let units: Vec<u16> = raw
         .get(4..)?
@@ -703,22 +714,46 @@ mod tests {
         );
     }
 
+    fn efivar(dir: &Path, name: &str, value: &str) {
+        let mut raw = vec![7, 0, 0, 0];
+        for u in value.encode_utf16().chain(std::iter::once(0)) {
+            raw.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(
+            dir.join(format!("{name}-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f")),
+            raw,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn reads_the_default_entry_efi_variable() {
         let dir = tempfile::tempdir().unwrap();
         let id = "opensuse-tumbleweed-7.2.0-1-default-1.conf";
-        let mut raw = vec![7, 0, 0, 0];
-        for u in id.encode_utf16().chain(std::iter::once(0)) {
-            raw.extend_from_slice(&u.to_le_bytes());
-        }
-        std::fs::write(
-            dir.path()
-                .join("LoaderEntryDefault-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"),
-            raw,
-        )
-        .unwrap();
+        efivar(dir.path(), "LoaderEntryDefault", id);
         assert_eq!(default_entry_from_efivars(dir.path()).as_deref(), Some(id));
         assert!(default_entry_from_efivars(&dir.path().join("nope")).is_none());
+    }
+
+    /// systemd 262, as on a real Tumbleweed machine: only the preferred entry,
+    /// with the one booted alongside it.
+    #[test]
+    fn reads_the_preferred_entry_systemd_262_keeps_the_default_in() {
+        let dir = tempfile::tempdir().unwrap();
+        efivar(
+            dir.path(),
+            "LoaderEntryPreferred",
+            "opensuse-tumbleweed-7.3.4-1-default-1.conf",
+        );
+        efivar(
+            dir.path(),
+            "LoaderEntrySelected",
+            "opensuse-tumbleweed-7.2.11-1-default-1.conf",
+        );
+        assert_eq!(
+            default_entry_from_efivars(dir.path()).as_deref(),
+            Some("opensuse-tumbleweed-7.3.4-1-default-1.conf")
+        );
     }
 
     #[test]
