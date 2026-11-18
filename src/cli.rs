@@ -654,6 +654,23 @@ pub fn render_removal_plan(plan: &RemovalPlan, style: Style) -> String {
             }
         }
     }
+    if plan.cleans_entries && plan.entries_read {
+        out.push_str(&format!(
+            "{}\n",
+            style.dim(
+                "boot entries for a removed kernel go from every snapshot that has another kernel to boot"
+            )
+        ));
+    } else if plan.cleans_entries {
+        out.push_str(&format!(
+            "{}\n",
+            style.yellow(&format!(
+                "boot entries need root to read: `sudo sluice remove {}` also lists kernels \
+                 other snapshots still hold on the ESP",
+                plan.component
+            ))
+        ));
+    }
     if let Some(esp) = &plan.esp {
         out.push_str(&format!(
             "ESP {}: {} MB free of {} MB ({}% used)\n",
@@ -976,19 +993,25 @@ pub fn run(cli: Cli) -> Result<i32> {
                 return Ok(1);
             }
             for v in &chosen {
-                println!(
-                    "{} {component} {}: {}",
-                    style.bold("remove"),
-                    v.version,
-                    v.packages.join(", ")
-                );
+                let mut what = v.packages.join(", ");
+                if !v.snapshots.is_empty() && plan.cleans_entries {
+                    if !what.is_empty() {
+                        what.push_str("; ");
+                    }
+                    what.push_str(&format!(
+                        "boot entries in snapshots {}",
+                        crate::boot::snapshot_ranges(&v.snapshots)
+                    ));
+                }
+                println!("{} {component} {}: {what}", style.bold("remove"), v.version);
             }
-            if !yes
-                && !confirm(&format!(
-                    "Uninstall {} package(s)?",
-                    chosen.iter().map(|v| v.packages.len()).sum::<usize>()
-                ))?
-            {
+            let packages: usize = chosen.iter().map(|v| v.packages.len()).sum();
+            let question = if packages > 0 {
+                format!("Uninstall {packages} package(s)?")
+            } else {
+                "Remove these boot entries?".to_string()
+            };
+            if !yes && !confirm(&question)? {
                 println!("{}", style.dim("cancelled"));
                 return Ok(1);
             }

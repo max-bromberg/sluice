@@ -128,6 +128,15 @@ is installed. It refuses the running kernel, the known-good one, the one under
 test (use `rollback --remove`), and the newest one, which the next update would
 only reinstall. A `multiversion.kernels` pin on a removed version is dropped with it.
 
+With sdbootutil every snapper snapshot has its own boot entry per kernel, and a
+kernel's files stay on the ESP while any entry uses them, so uninstalling the
+RPM alone frees little. `remove` also removes the kernel's entries from every
+other snapshot that has another kernel to boot (through `sdbootutil
+remove-kernel`, then one `update-predictions`); a snapshot it is the only
+kernel of keeps it. Run as root, it also lists kernels that are already
+uninstalled but still held on the ESP by older snapshots, and removes those
+entries the same way.
+
 Read-only commands run unprivileged. Mutating ones need root and say so. The
 dashboard runs unprivileged and re-executes itself under `pkexec` or `sudo` for
 a single action, showing you the exact argv before it runs.

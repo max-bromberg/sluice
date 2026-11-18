@@ -885,6 +885,16 @@ fn draw_remove(f: &mut Frame, picker: &super::state::RemovePicker) {
             Style::default().fg(if low { GATED } else { MUTED }),
         ));
     }
+    if picker.plan.cleans_entries && !picker.plan.entries_read {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!(
+                "kernels only other snapshots still hold are listed by `sudo sluice remove {}`",
+                picker.plan.component
+            ),
+            Style::default().fg(MUTED),
+        ));
+    }
     if picker.plan.removable().next().is_none() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(

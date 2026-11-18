@@ -218,6 +218,159 @@ pub fn default_entry_from_efivars(efivars_dir: &Path) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
+/// Where a boot entry boots from, as sdbootutil records it in the entry's
+/// version: `207_7.2.10-1-default` is kernel `7.2.10-1-default` in snapshot
+/// 207. Without a snapshot prefix the entry belongs to a system without
+/// snapshots.
+///
+/// Entries `bootctl` lists without a version are the boot loader's memory of
+/// entries that existed at boot and have since been deleted; they occupy
+/// nothing and are skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryTarget {
+    pub id: String,
+    pub snapshot: Option<String>,
+    /// The kernel release, `7.2.10-1-default`.
+    pub kernel: String,
+    pub is_default: bool,
+}
+
+pub fn entry_target(e: &BootEntry) -> Option<EntryTarget> {
+    let v = e.version.as_deref()?.trim();
+    // sdbootutil's own reading: `((?<snapshot>[0-9]*)[@_])?(?<kernel>.*)`.
+    let (snapshot, kernel) = match v.find(['_', '@']) {
+        Some(i) if i > 0 && v[..i].bytes().all(|b| b.is_ascii_digit()) => {
+            (Some(v[..i].to_string()), &v[i + 1..])
+        }
+        _ => (None, v),
+    };
+    // Only kernel entries: `<version>-<release>-<flavour>`, starting with a
+    // digit. memtest's `9.00-1.1` is not one, and must not count as a kernel
+    // a snapshot could fall back on.
+    let is_kernel = kernel.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        && kernel.splitn(3, '-').count() == 3;
+    is_kernel.then(|| EntryTarget {
+        id: e.id.clone(),
+        snapshot,
+        kernel: kernel.to_string(),
+        is_default: e.is_default,
+    })
+}
+
+/// The package-style version a kernel release names: `7.2.10-1-default` is
+/// `7.2.10-1`, which [`kernel_release_matches`] accepts for package `7.2.10-1.1`.
+pub fn kernel_release_evr(kernel: &str) -> Evr {
+    let mut parts = kernel.splitn(3, '-');
+    let version = parts.next().unwrap_or_default();
+    let release = parts.next().unwrap_or_default();
+    Evr {
+        epoch: 0,
+        version: version.to_string(),
+        release: release.to_string(),
+    }
+}
+
+/// What to do with the boot entries of kernels being removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryCleanup {
+    pub remove: Vec<EntryTarget>,
+    /// Entries left in place, with the reason.
+    pub keep: Vec<(EntryTarget, String)>,
+}
+
+impl EntryCleanup {
+    pub fn is_empty(&self) -> bool {
+        self.remove.is_empty() && self.keep.is_empty()
+    }
+}
+
+/// Decide which boot entries of `kernels` can go. With snapshots, each
+/// snapshot has its own entry per kernel, and the files on the ESP stay as
+/// long as any entry uses them — so uninstalling a kernel frees little until
+/// the other snapshots' entries for it go too.
+///
+/// An entry stays when it is the default, or when it is the last kernel its
+/// snapshot could boot: removing that would make the snapshot unbootable.
+pub fn plan_entry_cleanup(entries: &[BootEntry], kernels: &[Evr]) -> EntryCleanup {
+    let targets: Vec<EntryTarget> = entries.iter().filter_map(entry_target).collect();
+    let going = |t: &EntryTarget| kernels.iter().any(|k| kernel_release_matches(&t.kernel, k));
+    let mut out = EntryCleanup::default();
+    for t in targets.iter().filter(|t| going(t)) {
+        let others = targets
+            .iter()
+            .filter(|o| o.snapshot == t.snapshot && !going(o))
+            .count();
+        if t.is_default {
+            out.keep
+                .push((t.clone(), "it is the default boot entry".into()));
+        } else if others == 0 {
+            let what = t
+                .snapshot
+                .as_deref()
+                .map_or_else(|| "this system".to_string(), |s| format!("snapshot {s}"));
+            out.keep
+                .push((t.clone(), format!("it is the only kernel {what} can boot")));
+        } else {
+            out.remove.push(t.clone());
+        }
+    }
+    out
+}
+
+/// Remove one kernel's boot entry from one snapshot, through sdbootutil, so
+/// the files no other entry uses leave the ESP.
+///
+/// TPM2 predictions are left for [`sdbootutil_update_predictions`], run
+/// once after the last entry rather than once per entry.
+pub fn sdbootutil_remove_kernel(r: &mut Runner, t: &EntryTarget) -> Result<()> {
+    let mut cmd = Cmd::mutate("sdbootutil")
+        .arg("--disable-predictions")
+        .arg("remove-kernel")
+        .arg(&t.kernel);
+    if let Some(s) = &t.snapshot {
+        cmd = cmd.arg(s);
+    }
+    r.run(&cmd)?.require_ok("sdbootutil remove-kernel")?;
+    Ok(())
+}
+
+/// Bring TPM2 predictions in line with the boot entries. A no-op when no
+/// disk is unlocked by the TPM2.
+pub fn sdbootutil_update_predictions(r: &mut Runner) -> Result<()> {
+    r.run(&Cmd::mutate("sdbootutil").arg("update-predictions"))?
+        .require_ok("sdbootutil update-predictions")?;
+    Ok(())
+}
+
+/// Snapshot numbers as runs: `1, 194–207`.
+pub fn snapshot_ranges(snapshots: &[String]) -> String {
+    let mut nums: Vec<u64> = snapshots.iter().filter_map(|s| s.parse().ok()).collect();
+    nums.sort_unstable();
+    nums.dedup();
+    let mut runs: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < nums.len() {
+        let mut j = i;
+        while j + 1 < nums.len() && nums[j + 1] == nums[j] + 1 {
+            j += 1;
+        }
+        runs.push(match j - i {
+            0 => nums[i].to_string(),
+            1 => format!("{}, {}", nums[i], nums[j]),
+            _ => format!("{}–{}", nums[i], nums[j]),
+        });
+        i = j + 1;
+    }
+    // Anything that is not a number is kept as it is.
+    runs.extend(
+        snapshots
+            .iter()
+            .filter(|s| s.parse::<u64>().is_err())
+            .cloned(),
+    );
+    runs.join(", ")
+}
+
 pub fn set_default(r: &mut Runner, entry_id: &str) -> Result<()> {
     r.run(&Cmd::mutate("bootctl").arg("set-default").arg(entry_id))?
         .require_ok("bootctl set-default")?;
@@ -426,6 +579,128 @@ mod tests {
             entry("a-7.2.6-1-default-42.conf", "7.2.6-1-default", false),
         ];
         assert!(pick_entry(&entries, &Evr::parse("7.2.6-1.1")).is_none());
+    }
+
+    fn bentry(id: &str, version: Option<&str>, is_default: bool) -> BootEntry {
+        BootEntry {
+            id: id.into(),
+            title: None,
+            version: version.map(str::to_string),
+            is_default,
+            is_selected: false,
+        }
+    }
+
+    /// The shape of a real `bootctl list` after `zypper remove` of 7.2.10:
+    /// gone from the live system (1) and its post snapshot (208), still in
+    /// the older snapshots, and remembered by the loader without a version.
+    fn snapshot_entries() -> Vec<BootEntry> {
+        vec![
+            bentry(
+                "opensuse-tumbleweed-7.2.11-1-default-1.conf",
+                Some("1_7.2.11-1-default"),
+                true,
+            ),
+            bentry(
+                "opensuse-tumbleweed-7.2.11-1-default-208.conf",
+                Some("208_7.2.11-1-default"),
+                false,
+            ),
+            bentry(
+                "opensuse-tumbleweed-7.2.11-1-default-207.conf",
+                Some("207_7.2.11-1-default"),
+                false,
+            ),
+            bentry(
+                "opensuse-tumbleweed-7.2.10-1-default-207.conf",
+                Some("207_7.2.10-1-default"),
+                false,
+            ),
+            bentry(
+                "opensuse-tumbleweed-7.0.12-1-default-207.conf",
+                Some("207_7.0.12-1-default"),
+                false,
+            ),
+            // A snapshot that only ever had the old kernel.
+            bentry(
+                "opensuse-tumbleweed-7.2.10-1-default-150.conf",
+                Some("150_7.2.10-1-default"),
+                false,
+            ),
+            bentry("memtest86plus.conf", Some("9.00-1.1"), false),
+            bentry("opensuse-tumbleweed-7.2.10-1-default-1.conf", None, false),
+            bentry("auto-efi-default", None, false),
+        ]
+    }
+
+    #[test]
+    fn reads_snapshot_and_kernel_from_the_entry_version() {
+        let t = entry_target(&bentry("x.conf", Some("207_7.2.10-1-default"), false)).unwrap();
+        assert_eq!(t.snapshot.as_deref(), Some("207"));
+        assert_eq!(t.kernel, "7.2.10-1-default");
+        let t = entry_target(&bentry("x.conf", Some("7.2.10-1-default"), false)).unwrap();
+        assert_eq!(t.snapshot, None);
+        assert!(entry_target(&bentry("memtest86plus.conf", Some("9.00-1.1"), false)).is_none());
+        assert!(entry_target(&bentry("auto-efi-default", None, false)).is_none());
+        assert!(entry_target(&bentry("other.conf", Some("Windows"), false)).is_none());
+    }
+
+    #[test]
+    fn snapshots_read_as_runs() {
+        let s: Vec<String> = ["207", "1", "195", "194", "196", "188", "189"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(snapshot_ranges(&s), "1, 188, 189, 194–196, 207");
+    }
+
+    #[test]
+    fn a_kernel_release_reads_as_the_version_it_boots() {
+        let e = kernel_release_evr("7.2.10-1-default");
+        assert_eq!(e.to_string(), "7.2.10-1");
+        assert!(kernel_release_matches("7.2.10-1-default", &e));
+        assert!(kernel_release_matches(
+            "7.2.10-1-default",
+            &Evr::parse("7.2.10-1.1")
+        ));
+    }
+
+    #[test]
+    fn old_kernels_leave_every_snapshot_that_can_boot_another() {
+        let plan = plan_entry_cleanup(
+            &snapshot_entries(),
+            &[Evr::parse("7.2.10-1.1"), Evr::parse("7.0.12-1.1")],
+        );
+        let removed: Vec<&str> = plan.remove.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            removed,
+            vec![
+                "opensuse-tumbleweed-7.2.10-1-default-207.conf",
+                "opensuse-tumbleweed-7.0.12-1-default-207.conf",
+            ]
+        );
+        assert_eq!(plan.keep.len(), 1);
+        assert_eq!(plan.keep[0].0.snapshot.as_deref(), Some("150"));
+        assert!(plan.keep[0].1.contains("only kernel snapshot 150"));
+    }
+
+    #[test]
+    fn the_default_entry_is_never_removed() {
+        let plan = plan_entry_cleanup(&snapshot_entries(), &[Evr::parse("7.2.11-1.1")]);
+        assert!(plan
+            .keep
+            .iter()
+            .any(|(t, why)| t.snapshot.as_deref() == Some("1") && why.contains("default")));
+        // 208 has nothing else to boot.
+        assert!(plan
+            .keep
+            .iter()
+            .any(|(t, _)| t.snapshot.as_deref() == Some("208")));
+        let removed: Vec<&str> = plan.remove.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            removed,
+            vec!["opensuse-tumbleweed-7.2.11-1-default-207.conf"]
+        );
     }
 
     #[test]

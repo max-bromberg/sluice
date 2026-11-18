@@ -628,7 +628,18 @@ impl Dashboard {
         let mut details = Vec::new();
         for v in &chosen {
             details.push((Tone::Heading, format!("{component}  {}", v.version)));
-            details.push((Tone::Plain, format!("  removes {}", v.packages.join(", "))));
+            if !v.packages.is_empty() {
+                details.push((Tone::Plain, format!("  removes {}", v.packages.join(", "))));
+            }
+            if picker.plan.cleans_entries && !v.snapshots.is_empty() {
+                details.push((
+                    Tone::Plain,
+                    format!(
+                        "  and its boot entries in snapshots {}",
+                        crate::boot::snapshot_ranges(&v.snapshots)
+                    ),
+                ));
+            }
             if v.roles.iter().any(|r| r.starts_with("pinned")) {
                 details.push((
                     Tone::Faint,
@@ -654,11 +665,20 @@ impl Dashboard {
                 ),
             ));
         }
-        details.push((
-            Tone::Warn,
-            "zypper also removes anything that depends on these packages; its output is shown after"
-                .into(),
-        ));
+        if picker.plan.cleans_entries {
+            details.push((
+                Tone::Faint,
+                "other snapshots' boot entries for it go too, wherever the snapshot has another kernel to boot"
+                    .into(),
+            ));
+        }
+        if chosen.iter().any(|v| v.installed) {
+            details.push((
+                Tone::Warn,
+                "zypper also removes anything that depends on these packages; its output is shown after"
+                    .into(),
+            ));
+        }
         a.details = details;
         Some(a)
     }
@@ -966,6 +986,8 @@ mod tests {
     fn version(v: &str, blockers: &[&str]) -> InstalledVersion {
         InstalledVersion {
             version: crate::version::Evr::parse(v),
+            installed: true,
+            snapshots: Vec::new(),
             packages: vec![format!("kernel-default-{v}.x86_64")],
             roles: Vec::new(),
             blockers: blockers.iter().map(|b| b.to_string()).collect(),
@@ -982,6 +1004,8 @@ mod tests {
                 version("7.2.9-1.1", &[]),
             ],
             esp: None,
+            cleans_entries: false,
+            entries_read: false,
         })
     }
 

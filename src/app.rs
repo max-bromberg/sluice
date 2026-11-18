@@ -1464,6 +1464,10 @@ impl App {
     /// promises: the kernel this session runs on, the rollback target, the
     /// version under test, the one the boot default is held on, or the newest
     /// installed one, which updates would only put straight back.
+    ///
+    /// With sdbootutil, a kernel that is no longer installed is listed too
+    /// while other snapshots' boot entries still use it, since those keep its
+    /// files on the ESP. Reading the entries needs root.
     pub fn removal_plan(&mut self, component: &str) -> Result<RemovalPlan> {
         let cfg = self.config.component(component)?.clone();
         let anchor = cfg.anchor.clone().with_context(|| {
@@ -1488,8 +1492,36 @@ impl App {
             None
         };
 
+        let cleans_entries = cfg.boot_entries
+            && boot::detect_manager(&self.config.boot) == crate::config::BootManager::Sdbootutil;
+        let entries = if cleans_entries {
+            boot::entries(&self.config.boot, &mut self.runner).unwrap_or(None)
+        } else {
+            None
+        };
+        let entries_read = entries.is_some();
+        let entries = entries.unwrap_or_default();
+        let targets: Vec<boot::EntryTarget> =
+            entries.iter().filter_map(boot::entry_target).collect();
+        let snapshots_of = |v: &Evr| -> Vec<String> {
+            let mut s: Vec<String> = targets
+                .iter()
+                .filter(|t| boot::kernel_release_matches(&t.kernel, v))
+                .filter_map(|t| t.snapshot.clone())
+                .collect();
+            s.sort_by_key(|n| n.parse::<u64>().unwrap_or(u64::MAX));
+            s.dedup();
+            s
+        };
+        let in_snapshots = |n: usize| {
+            format!(
+                "boot entries in {n} snapshot{}",
+                if n == 1 { "" } else { "s" }
+            )
+        };
+
         let mut out = Vec::new();
-        for v in versions {
+        for v in versions.clone() {
             let mut roles = Vec::new();
             let mut blockers = Vec::new();
 
@@ -1538,17 +1570,59 @@ impl App {
                 roles.push("pinned against purge-kernels".to_string());
             }
 
+            let snapshots = snapshots_of(&v);
+            if snapshots.len() > 1 {
+                roles.push(in_snapshots(snapshots.len()));
+            }
+
             let packages = Self::family_installed_at(&cfg, &installed, &v)
                 .iter()
                 .map(Pkg::nevra)
                 .collect();
             out.push(InstalledVersion {
                 version: v,
+                installed: true,
                 packages,
+                snapshots,
                 roles,
                 blockers,
             });
         }
+
+        // Kernels already uninstalled that other snapshots still boot.
+        let mut leftovers: Vec<Evr> = targets
+            .iter()
+            .filter(|t| {
+                !versions
+                    .iter()
+                    .any(|v| boot::kernel_release_matches(&t.kernel, v))
+            })
+            .map(|t| boot::kernel_release_evr(&t.kernel))
+            .collect();
+        leftovers.sort();
+        leftovers.dedup();
+        for v in leftovers {
+            let snapshots = snapshots_of(&v);
+            let cleanup = boot::plan_entry_cleanup(&entries, std::slice::from_ref(&v));
+            let mut blockers = Vec::new();
+            if cleanup.remove.is_empty() {
+                let mut why: Vec<String> = cleanup.keep.iter().map(|(_, w)| w.clone()).collect();
+                why.dedup();
+                blockers.push(format!(
+                    "none of its boot entries can go: {}",
+                    why.join("; ")
+                ));
+            }
+            out.push(InstalledVersion {
+                version: v,
+                installed: false,
+                packages: Vec::new(),
+                roles: vec!["not installed".into(), in_snapshots(snapshots.len())],
+                snapshots,
+                blockers,
+            });
+        }
+        out.sort_by(|a, b| a.version.cmp(&b.version));
 
         let esp = if cfg.boot_entries {
             boot::esp_status(&self.config.boot, &mut self.runner)
@@ -1561,6 +1635,8 @@ impl App {
             component: component.to_string(),
             versions: out,
             esp,
+            cleans_entries,
+            entries_read,
         })
     }
 
@@ -1576,10 +1652,15 @@ impl App {
             .collect()
     }
 
-    /// Uninstall installed versions of a component, to make room — typically
-    /// on the ESP before a new kernel series. Every version is checked against
+    /// Uninstall versions of a component, to make room — typically on the ESP
+    /// before a new kernel series. Every version is checked against
     /// [`App::removal_plan`] first, and nothing is removed unless all of them
     /// can be. A `multiversion.kernels` pin of a removed version goes with it.
+    ///
+    /// With sdbootutil, the versions' boot entries in other snapshots go too,
+    /// wherever that snapshot has another kernel to boot: until they do, the
+    /// files they use stay on the ESP. A version that is no longer installed
+    /// only has those entries removed.
     pub fn remove_versions(
         &mut self,
         component: &str,
@@ -1594,16 +1675,21 @@ impl App {
         let plan = self.removal_plan(component)?;
 
         let mut chosen: Vec<Evr> = Vec::new();
+        let mut to_uninstall: Vec<Evr> = Vec::new();
         for r in requested {
             let v = plan.find(r).with_context(|| {
-                format!(
-                    "{component} {r} is not installed (installed: {})",
-                    plan.versions
-                        .iter()
-                        .map(|v| v.version.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+                let listed = plan
+                    .versions
+                    .iter()
+                    .map(|v| v.version.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let hint = if plan.cleans_entries && !plan.entries_read {
+                    "; kernels only other snapshots' boot entries still use are listed when run as root"
+                } else {
+                    ""
+                };
+                format!("{component} {r} is not installed (listed: {listed}){hint}")
             })?;
             anyhow::ensure!(
                 v.blockers.is_empty(),
@@ -1613,13 +1699,16 @@ impl App {
             );
             if !chosen.contains(&v.version) {
                 chosen.push(v.version.clone());
+                if v.installed {
+                    to_uninstall.push(v.version.clone());
+                }
             }
         }
 
         let (cfg, eval) = self.eval_of(component, now)?;
         let (installed, _) = self.packages(&cfg)?;
         let mut to_remove: Vec<Pkg> = Vec::new();
-        for v in &chosen {
+        for v in &to_uninstall {
             for p in Self::family_installed_at(&cfg, &installed, v) {
                 if !to_remove.contains(&p) {
                     to_remove.push(p);
@@ -1627,9 +1716,9 @@ impl App {
             }
         }
         anyhow::ensure!(
-            !to_remove.is_empty(),
+            to_uninstall.is_empty() || !to_remove.is_empty(),
             "no installed packages found for {component} {}",
-            chosen
+            to_uninstall
                 .iter()
                 .map(Evr::to_string)
                 .collect::<Vec<_>>()
@@ -1638,14 +1727,14 @@ impl App {
 
         // A lock covering these versions would make zypper refuse; lift
         // sluice's own for this one transaction, as rollback does.
-        let owned: Vec<LockSpec> = self
-            .backend
-            .locks(&mut self.runner)?
-            .into_iter()
-            .filter(|l| owns(l, &eval))
-            .collect();
-        let state_dir = self.config.paths.state_dir.clone();
-        {
+        if !to_remove.is_empty() {
+            let owned: Vec<LockSpec> = self
+                .backend
+                .locks(&mut self.runner)?
+                .into_iter()
+                .filter(|l| owns(l, &eval))
+                .collect();
+            let state_dir = self.config.paths.state_dir.clone();
             let window = gate::LockWindow::open(
                 self.backend.as_ref(),
                 &mut self.runner,
@@ -1657,6 +1746,11 @@ impl App {
             let result = self.backend.remove_exact(&mut self.runner, &to_remove);
             window.close(&mut self.runner)?;
             result?;
+        }
+
+        // Read after the transaction: snapper's snapshot of it has entries too.
+        if plan.cleans_entries {
+            notes.extend(self.remove_boot_entries(&chosen));
         }
 
         // A pin for a version that is gone protects nothing.
@@ -1703,6 +1797,62 @@ impl App {
             esp_after,
             notes,
         })
+    }
+
+    /// Remove the boot entries of `kernels` from every snapshot that has
+    /// another kernel to boot, through sdbootutil. Returns what happened.
+    fn remove_boot_entries(&mut self, kernels: &[Evr]) -> Vec<String> {
+        let mut notes = Vec::new();
+        let what = kernels
+            .iter()
+            .map(Evr::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let Some(entries) = boot::entries(&self.config.boot, &mut self.runner).unwrap_or(None)
+        else {
+            notes.push(format!(
+                "boot entries could not be read, so other snapshots' entries for {what} were left, \
+                 and their files stay on the ESP"
+            ));
+            return notes;
+        };
+        let cleanup = boot::plan_entry_cleanup(&entries, kernels);
+
+        let mut removed: Vec<String> = Vec::new();
+        for t in &cleanup.remove {
+            match boot::sdbootutil_remove_kernel(&mut self.runner, t) {
+                Ok(()) => removed.push(t.snapshot.clone().unwrap_or_else(|| "this system".into())),
+                Err(e) => notes.push(format!("could not remove boot entry {}: {e:#}", t.id)),
+            }
+        }
+        if !removed.is_empty() {
+            notes.push(format!(
+                "{} {} boot entr{} for {what} from snapshot{} {}",
+                if self.runner.dry_run() {
+                    "would remove"
+                } else {
+                    "removed"
+                },
+                removed.len(),
+                if removed.len() == 1 { "y" } else { "ies" },
+                if removed.len() == 1 { "" } else { "s" },
+                boot::snapshot_ranges(&removed)
+            ));
+            if let Err(e) = boot::sdbootutil_update_predictions(&mut self.runner) {
+                notes.push(format!(
+                    "could not update TPM2 predictions: {e:#}. Run `sudo sdbootutil update-predictions` before rebooting"
+                ));
+            }
+        }
+        for (t, why) in &cleanup.keep {
+            let later = if why.contains("only kernel") {
+                "; it goes when snapper deletes the snapshot"
+            } else {
+                ""
+            };
+            notes.push(format!("kept boot entry {}: {why}{later}", t.id));
+        }
+        notes
     }
 
     // -----------------------------------------------------------------------
@@ -2683,12 +2833,19 @@ pub struct PromoteReport {
     pub notes: Vec<String>,
 }
 
-/// One installed version of a component, as [`App::removal_plan`] sees it.
+/// One version of a component as [`App::removal_plan`] sees it: installed,
+/// or uninstalled but still booted by other snapshots' boot entries, which
+/// keep its files on the ESP.
 #[derive(Debug, Clone)]
 pub struct InstalledVersion {
     pub version: Evr,
+    /// Whether its packages are installed. When not, removing it only
+    /// removes boot entries.
+    pub installed: bool,
     /// The packages that would be removed with it.
     pub packages: Vec<String>,
+    /// Snapshots with a boot entry for it, when the entries could be read.
+    pub snapshots: Vec<String>,
     /// What it is to sluice: running, known-good, under test, newest, ….
     pub roles: Vec<String>,
     /// Why it must stay; empty when it can be removed.
@@ -2708,12 +2865,18 @@ pub struct RemovalPlan {
     /// Oldest first.
     pub versions: Vec<InstalledVersion>,
     pub esp: Option<EspStatus>,
+    /// Whether other snapshots' boot entries are cleaned up with a removal
+    /// (sdbootutil manages them).
+    pub cleans_entries: bool,
+    /// Whether the boot entries could be read. They need root; without
+    /// them, versions only other snapshots still boot are not listed.
+    pub entries_read: bool,
 }
 
 impl RemovalPlan {
-    /// The installed version a user typed: the full `7.2.10-1.1`, the bare
-    /// `7.2.10` when only one release of it is installed, or a kernel release
-    /// such as `7.2.10-1-default`.
+    /// The version a user typed: the full `7.2.10-1.1`, the bare `7.2.10`
+    /// when only one release of it is listed, or a kernel release such as
+    /// `7.2.10-1-default`.
     pub fn find(&self, wanted: &str) -> Option<&InstalledVersion> {
         let wanted = wanted.trim();
         if let Some(v) = self
@@ -2736,7 +2899,21 @@ impl RemovalPlan {
             .iter()
             .filter(|v| boot::kernel_release_matches(wanted, &v.version))
             .collect();
-        match by_release.as_slice() {
+        if let [one] = by_release.as_slice() {
+            return Some(one);
+        }
+        // A package version (`7.2.10-1.1`) for a version only boot entries
+        // know, which they name by kernel release (`7.2.10-1`).
+        let w = Evr::parse(wanted);
+        let major = |r: &str| r.split('.').next().unwrap_or("").to_string();
+        let by_build: Vec<&InstalledVersion> = self
+            .versions
+            .iter()
+            .filter(|v| {
+                v.version.version == w.version && major(&v.version.release) == major(&w.release)
+            })
+            .collect();
+        match by_build.as_slice() {
             [one] => Some(one),
             _ => None,
         }
