@@ -74,6 +74,7 @@ pub fn draw(f: &mut Frame, d: &mut Dashboard) {
     match d.modal.clone() {
         Modal::Confirm(action) => draw_confirm(f, &action),
         Modal::Help => draw_help(f),
+        Modal::Remove(picker) => draw_remove(f, &picker),
         Modal::Output { title, body, ok } => draw_output(f, &title, &body, ok),
         Modal::None => {}
     }
@@ -687,6 +688,7 @@ fn draw_footer(f: &mut Frame, area: Rect, d: &Dashboard) {
             ("p", "promote"),
             ("m", "mark good"),
             ("b", "roll back"),
+            ("x", "remove old"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -699,8 +701,16 @@ fn draw_footer(f: &mut Frame, area: Rect, d: &Dashboard) {
             ("p", "promote"),
             ("m", "mark good"),
             ("b", "roll back"),
+            ("x", "remove old"),
             ("?", "help"),
             ("q", "quit"),
+        ],
+        Modal::Remove(_) => &[
+            ("↑↓", "move"),
+            ("space", "choose"),
+            ("a", "all"),
+            ("enter", "continue"),
+            ("esc", "cancel"),
         ],
         Modal::Confirm(_) => &[("y", "confirm"), ("n/esc", "cancel")],
         _ => &[("esc", "close")],
@@ -796,6 +806,114 @@ fn draw_confirm(f: &mut Frame, action: &super::state::PendingAction) {
     );
 }
 
+fn draw_remove(f: &mut Frame, picker: &super::state::RemovePicker) {
+    let area = centered(76, 70, f.area());
+    f.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::styled(
+            "Choose the versions to uninstall. The ones sluice relies on stay.",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    let width = picker
+        .plan
+        .versions
+        .iter()
+        .map(|v| v.version.to_string().len())
+        .max()
+        .unwrap_or(0);
+    for (i, v) in picker.plan.versions.iter().enumerate() {
+        let here = i == picker.cursor;
+        let pointer = if here { "▸ " } else { "  " };
+        let mark = match (v.removable(), picker.chosen[i]) {
+            (false, _) => "   ",
+            (true, true) => "[x]",
+            (true, false) => "[ ]",
+        };
+        let version = format!("{:<width$}", v.version.to_string());
+        let (verdict, color) = if v.removable() {
+            if picker.chosen[i] {
+                ("remove", BAD)
+            } else {
+                ("can remove", GOOD)
+            }
+        } else {
+            ("keep", GATED)
+        };
+        let mut style = Style::default();
+        if here {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        let roles = if v.roles.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", v.roles.join(", "))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{pointer}{mark} {version}  "), style),
+            Span::styled(verdict.to_string(), style.fg(color)),
+            Span::styled(roles, Style::default().fg(MUTED)),
+        ]));
+        if here {
+            for b in &v.blockers {
+                lines.push(Line::styled(
+                    format!("        {b}"),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            if v.removable() && !v.packages.is_empty() {
+                lines.push(Line::styled(
+                    format!("        removes {}", v.packages.join(", ")),
+                    Style::default().fg(MUTED),
+                ));
+            }
+        }
+    }
+    if let Some(esp) = &picker.plan.esp {
+        lines.push(Line::raw(""));
+        let low = esp.free_mb * 4 < esp.total_mb;
+        lines.push(Line::styled(
+            format!(
+                "ESP {}: {} MB free of {} MB ({}% used)",
+                esp.path.display(),
+                esp.free_mb,
+                esp.total_mb,
+                esp.used_percent()
+            ),
+            Style::default().fg(if low { GATED } else { MUTED }),
+        ));
+    }
+    if picker.plan.removable().next().is_none() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "nothing can be removed",
+            Style::default().fg(MUTED),
+        ));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(GATED))
+                .title(Span::styled(
+                    format!(" remove {} versions ", picker.plan.component),
+                    Style::default().fg(GATED).add_modifier(Modifier::BOLD),
+                ))
+                .title_bottom(
+                    Line::from(Span::styled(
+                        " space choose · a all · enter continue · esc cancel ",
+                        Style::default().fg(MUTED),
+                    ))
+                    .alignment(Alignment::Center),
+                ),
+        ),
+        area,
+    );
+}
+
 fn draw_output(f: &mut Frame, title: &str, body: &str, ok: bool) {
     let area = centered(80, 70, f.area());
     f.render_widget(Clear, area);
@@ -850,6 +968,7 @@ fn draw_help(f: &mut Frame) {
         ("m", "mark good — vault and pin the installed version"),
         ("b", "roll back — boot the known-good version again"),
         ("U", "update sluice itself, when a release is out"),
+        ("x", "remove old versions, e.g. to free ESP space"),
         ("", ""),
         ("pgup/pgdn", "scroll the detail pane"),
         ("q / ctrl-c", "quit"),

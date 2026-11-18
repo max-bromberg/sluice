@@ -831,6 +831,9 @@ impl App {
         now: DateTime<Utc>,
     ) -> Result<Vec<PromotePreview>> {
         let locks = self.backend.locks(&mut self.runner).unwrap_or_default();
+        let esp = boot::esp_status(&self.config.boot, &mut self.runner)
+            .ok()
+            .flatten();
         let mut out = Vec::new();
         for component in members {
             let (cfg, eval) = self.eval_of(component, now)?;
@@ -910,6 +913,18 @@ impl App {
             };
 
             if cfg.boot_entries {
+                // The new kernel lands next to the old ones before anything is
+                // purged, so it has to fit as things stand.
+                if let Some(e) = esp
+                    .as_ref()
+                    .filter(|e| e.is_low(self.config.boot.esp_warn_free_mb))
+                {
+                    p.warnings.push(format!(
+                        "the ESP has only {} MB free of {} MB, and {target} may not fit beside the installed kernels; \
+                         `sluice remove {component}` shows which ones can go",
+                        e.free_mb, e.total_mb
+                    ));
+                }
                 p.notes.push(format!(
                     "{target} becomes the default boot entry; the previous kernels stay installed"
                 ));
@@ -1435,6 +1450,258 @@ impl App {
             installed: true,
             steps,
             note,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // remove
+    // -----------------------------------------------------------------------
+
+    /// Every installed version of a component, what each one is to sluice,
+    /// and whether it can be removed. Read-only.
+    ///
+    /// A version is kept when removing it would take away something sluice
+    /// promises: the kernel this session runs on, the rollback target, the
+    /// version under test, the one the boot default is held on, or the newest
+    /// installed one, which updates would only put straight back.
+    pub fn removal_plan(&mut self, component: &str) -> Result<RemovalPlan> {
+        let cfg = self.config.component(component)?.clone();
+        let anchor = cfg.anchor.clone().with_context(|| {
+            format!("`{component}` has no anchor package, so its installed versions cannot be told apart")
+        })?;
+        let (installed, _) = self.packages(&cfg)?;
+        let mut versions: Vec<Evr> = installed
+            .iter()
+            .filter(|p| p.name == anchor)
+            .map(|p| p.evr.clone())
+            .collect();
+        versions.sort();
+        versions.dedup();
+        let newest = versions.last().cloned();
+
+        let cstate = self.state.component(component);
+        let multiversion = if cfg.boot_entries {
+            boot::read_multiversion(&self.config.boot.package_manager_conf)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        let mut out = Vec::new();
+        for v in versions {
+            let mut roles = Vec::new();
+            let mut blockers = Vec::new();
+
+            let running = cfg.boot_entries
+                && self
+                    .running_kernel
+                    .as_deref()
+                    .is_some_and(|r| boot::kernel_release_matches(r, &v));
+            if running {
+                roles.push("running".to_string());
+                blockers.push(
+                    "it is the running kernel; removing it would pull modules out from under this session"
+                        .to_string(),
+                );
+            }
+            if cstate.known_good.as_ref() == Some(&v) {
+                roles.push("known-good".to_string());
+                blockers.push(format!(
+                    "it is the rollback target; mark another version good first (`sluice mark-good {component} VERSION`)"
+                ));
+            }
+            if cstate.testing.as_ref() == Some(&v) {
+                roles.push("under test".to_string());
+                blockers.push(format!(
+                    "it is under test; `sluice rollback {component} --remove` is how a tested version is removed"
+                ));
+            }
+            if cfg.boot_entries
+                && cstate.boot_pin.as_ref() == Some(&v)
+                && cstate.known_good.as_ref() != Some(&v)
+            {
+                roles.push("boot default".to_string());
+                blockers.push("the default boot entry is held on it".to_string());
+            }
+            if newest.as_ref() == Some(&v) {
+                roles.push("newest".to_string());
+                blockers.push(
+                    "it is the newest installed version; the next update would only install it again"
+                        .to_string(),
+                );
+            }
+            if multiversion
+                .as_ref()
+                .is_some_and(|mv| mv.contains(&v.to_string()))
+            {
+                roles.push("pinned against purge-kernels".to_string());
+            }
+
+            let packages = Self::family_installed_at(&cfg, &installed, &v)
+                .iter()
+                .map(Pkg::nevra)
+                .collect();
+            out.push(InstalledVersion {
+                version: v,
+                packages,
+                roles,
+                blockers,
+            });
+        }
+
+        let esp = if cfg.boot_entries {
+            boot::esp_status(&self.config.boot, &mut self.runner)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        Ok(RemovalPlan {
+            component: component.to_string(),
+            versions: out,
+            esp,
+        })
+    }
+
+    /// The installed packages that belong to `version` of a component: its
+    /// family at that build, and the kernel modules built for it.
+    fn family_installed_at(cfg: &ComponentConfig, installed: &[Pkg], version: &Evr) -> Vec<Pkg> {
+        policy::resolve_family(cfg, installed, Some(version))
+            .into_iter()
+            .filter(|p| {
+                policy::same_build(cfg, &p.evr, version)
+                    || (policy::is_kmp(&p.name) && policy::kmp_built_for(&p.evr, version))
+            })
+            .collect()
+    }
+
+    /// Uninstall installed versions of a component, to make room — typically
+    /// on the ESP before a new kernel series. Every version is checked against
+    /// [`App::removal_plan`] first, and nothing is removed unless all of them
+    /// can be. A `multiversion.kernels` pin of a removed version goes with it.
+    pub fn remove_versions(
+        &mut self,
+        component: &str,
+        requested: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<RemoveReport> {
+        anyhow::ensure!(
+            !requested.is_empty(),
+            "name at least one version of `{component}` to remove"
+        );
+        let mut notes: Vec<String> = self.repair_locks()?.into_iter().collect();
+        let plan = self.removal_plan(component)?;
+
+        let mut chosen: Vec<Evr> = Vec::new();
+        for r in requested {
+            let v = plan.find(r).with_context(|| {
+                format!(
+                    "{component} {r} is not installed (installed: {})",
+                    plan.versions
+                        .iter()
+                        .map(|v| v.version.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            anyhow::ensure!(
+                v.blockers.is_empty(),
+                "cannot remove {component} {}: {}",
+                v.version,
+                v.blockers.join("; ")
+            );
+            if !chosen.contains(&v.version) {
+                chosen.push(v.version.clone());
+            }
+        }
+
+        let (cfg, eval) = self.eval_of(component, now)?;
+        let (installed, _) = self.packages(&cfg)?;
+        let mut to_remove: Vec<Pkg> = Vec::new();
+        for v in &chosen {
+            for p in Self::family_installed_at(&cfg, &installed, v) {
+                if !to_remove.contains(&p) {
+                    to_remove.push(p);
+                }
+            }
+        }
+        anyhow::ensure!(
+            !to_remove.is_empty(),
+            "no installed packages found for {component} {}",
+            chosen
+                .iter()
+                .map(Evr::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        // A lock covering these versions would make zypper refuse; lift
+        // sluice's own for this one transaction, as rollback does.
+        let owned: Vec<LockSpec> = self
+            .backend
+            .locks(&mut self.runner)?
+            .into_iter()
+            .filter(|l| owns(l, &eval))
+            .collect();
+        let state_dir = self.config.paths.state_dir.clone();
+        {
+            let window = gate::LockWindow::open(
+                self.backend.as_ref(),
+                &mut self.runner,
+                &state_dir,
+                owned,
+                "remove",
+            )?;
+            window.check_interrupted()?;
+            let result = self.backend.remove_exact(&mut self.runner, &to_remove);
+            window.close(&mut self.runner)?;
+            result?;
+        }
+
+        // A pin for a version that is gone protects nothing.
+        if cfg.boot_entries {
+            let conf = self.config.boot.package_manager_conf.clone();
+            if let Ok(Some(mut mv)) = boot::read_multiversion(&conf) {
+                let unpinned: Vec<String> = chosen
+                    .iter()
+                    .filter(|v| mv.unpin(v))
+                    .map(Evr::to_string)
+                    .collect();
+                if !unpinned.is_empty() {
+                    match boot::write_multiversion(&conf, &mv, self.runner.dry_run()) {
+                        Ok(_) => notes.push(format!(
+                            "unpinned {} from multiversion.kernels = {}",
+                            unpinned.join(", "),
+                            mv.render()
+                        )),
+                        Err(e) => notes.push(format!(
+                            "could not unpin {} from multiversion.kernels: {e:#}",
+                            unpinned.join(", ")
+                        )),
+                    }
+                }
+            }
+            self.state.pinned.retain(|p| !chosen.contains(p));
+        }
+
+        notes.extend(self.enforce_boot_defaults(now)?);
+        self.save()?;
+
+        let esp_after = if cfg.boot_entries && !self.runner.dry_run() {
+            boot::esp_status(&self.config.boot, &mut self.runner)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        Ok(RemoveReport {
+            component: component.to_string(),
+            removed: chosen,
+            packages: to_remove.iter().map(Pkg::nevra).collect(),
+            esp_before: plan.esp,
+            esp_after,
+            notes,
         })
     }
 
@@ -2002,11 +2269,19 @@ impl App {
                 alerts.push((
                     Urgency::Warning,
                     format!(
-                        "ESP {} has {} MB free of {} MB ({}% used); new kernels may fail to install",
+                        "ESP {} has {} MB free of {} MB ({}% used); new kernels may fail to install{}",
                         esp.path.display(),
                         esp.free_mb,
                         esp.total_mb,
-                        esp.used_percent()
+                        esp.used_percent(),
+                        self.config
+                            .components
+                            .iter()
+                            .find(|(_, c)| c.boot_entries)
+                            .map(|(name, _)| format!(
+                                ". `sluice remove {name}` shows which kernels can go"
+                            ))
+                            .unwrap_or_default()
                     ),
                 ));
             }
@@ -2408,6 +2683,82 @@ pub struct PromoteReport {
     pub notes: Vec<String>,
 }
 
+/// One installed version of a component, as [`App::removal_plan`] sees it.
+#[derive(Debug, Clone)]
+pub struct InstalledVersion {
+    pub version: Evr,
+    /// The packages that would be removed with it.
+    pub packages: Vec<String>,
+    /// What it is to sluice: running, known-good, under test, newest, ….
+    pub roles: Vec<String>,
+    /// Why it must stay; empty when it can be removed.
+    pub blockers: Vec<String>,
+}
+
+impl InstalledVersion {
+    pub fn removable(&self) -> bool {
+        self.blockers.is_empty()
+    }
+}
+
+/// See [`App::removal_plan`].
+#[derive(Debug, Clone)]
+pub struct RemovalPlan {
+    pub component: String,
+    /// Oldest first.
+    pub versions: Vec<InstalledVersion>,
+    pub esp: Option<EspStatus>,
+}
+
+impl RemovalPlan {
+    /// The installed version a user typed: the full `7.2.10-1.1`, the bare
+    /// `7.2.10` when only one release of it is installed, or a kernel release
+    /// such as `7.2.10-1-default`.
+    pub fn find(&self, wanted: &str) -> Option<&InstalledVersion> {
+        let wanted = wanted.trim();
+        if let Some(v) = self
+            .versions
+            .iter()
+            .find(|v| v.version.to_string() == wanted)
+        {
+            return Some(v);
+        }
+        let by_version: Vec<&InstalledVersion> = self
+            .versions
+            .iter()
+            .filter(|v| v.version.version == wanted)
+            .collect();
+        if let [one] = by_version.as_slice() {
+            return Some(one);
+        }
+        let by_release: Vec<&InstalledVersion> = self
+            .versions
+            .iter()
+            .filter(|v| boot::kernel_release_matches(wanted, &v.version))
+            .collect();
+        match by_release.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
+
+    pub fn removable(&self) -> impl Iterator<Item = &InstalledVersion> {
+        self.versions.iter().filter(|v| v.removable())
+    }
+}
+
+/// See [`App::remove_versions`].
+#[derive(Debug)]
+pub struct RemoveReport {
+    pub component: String,
+    pub removed: Vec<Evr>,
+    pub packages: Vec<String>,
+    pub esp_before: Option<EspStatus>,
+    /// Not measured on a dry run.
+    pub esp_after: Option<EspStatus>,
+    pub notes: Vec<String>,
+}
+
 /// See [`App::promote_preview`].
 #[derive(Debug, Clone, Default)]
 pub struct PromotePreview {
@@ -2423,6 +2774,8 @@ pub struct PromotePreview {
     pub gate_after: Vec<String>,
     /// Reasons it cannot go ahead.
     pub blockers: Vec<String>,
+    /// Reasons it may go wrong, which do not stop it.
+    pub warnings: Vec<String>,
     pub notes: Vec<String>,
 }
 

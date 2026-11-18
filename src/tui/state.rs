@@ -9,7 +9,7 @@ use ratatui::layout::Rect;
 use super::boots::{BootsView, Event};
 use super::timeline::{Source, TimelineView};
 use super::worker::{Request, Response, Worker};
-use crate::app::{App, Status};
+use crate::app::{App, InstalledVersion, RemovalPlan, Status};
 use crate::config::{Config, LineageSource};
 use crate::health::HealthReport;
 use crate::privilege::{self, Escalator};
@@ -79,12 +79,82 @@ pub enum Modal {
     None,
     Confirm(PendingAction),
     Help,
+    /// Choosing which installed versions to remove.
+    Remove(RemovePicker),
     /// The result of the last escalated command.
     Output {
         title: String,
         body: String,
         ok: bool,
     },
+}
+
+/// The installed versions of one component, some of them chosen for removal.
+#[derive(Debug, Clone)]
+pub struct RemovePicker {
+    pub plan: RemovalPlan,
+    pub cursor: usize,
+    pub chosen: Vec<bool>,
+}
+
+impl RemovePicker {
+    pub fn new(plan: RemovalPlan) -> Self {
+        let cursor = plan
+            .versions
+            .iter()
+            .position(InstalledVersion::removable)
+            .unwrap_or(0);
+        let chosen = vec![false; plan.versions.len()];
+        RemovePicker {
+            plan,
+            cursor,
+            chosen,
+        }
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.plan.versions.len() {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Choose or unchoose the version under the cursor; one that must stay
+    /// cannot be chosen.
+    pub fn toggle(&mut self) {
+        if self
+            .plan
+            .versions
+            .get(self.cursor)
+            .is_some_and(InstalledVersion::removable)
+        {
+            self.chosen[self.cursor] = !self.chosen[self.cursor];
+        }
+    }
+
+    /// Choose every removable version, or none if they all already are.
+    pub fn toggle_all(&mut self) {
+        let removable: Vec<usize> = (0..self.plan.versions.len())
+            .filter(|&i| self.plan.versions[i].removable())
+            .collect();
+        let all = removable.iter().all(|&i| self.chosen[i]);
+        for i in removable {
+            self.chosen[i] = !all;
+        }
+    }
+
+    pub fn chosen_versions(&self) -> Vec<&InstalledVersion> {
+        self.plan
+            .versions
+            .iter()
+            .zip(&self.chosen)
+            .filter(|(v, c)| **c && v.removable())
+            .map(|(v, _)| v)
+            .collect()
+    }
 }
 
 /// A row in the component list: a component, or a bundle of them.
@@ -498,6 +568,101 @@ impl Dashboard {
         }
     }
 
+    /// The component whose versions `x` removes: the selection, or for a
+    /// bundle, its member with boot entries.
+    fn removal_target(&self) -> Option<String> {
+        match self.selected_entry()? {
+            Entry::Component(c) => Some(c),
+            Entry::Bundle(b) => self
+                .app
+                .config
+                .bundles
+                .get(&b)?
+                .components
+                .iter()
+                .find(|m| {
+                    self.app
+                        .config
+                        .components
+                        .get(*m)
+                        .is_some_and(|c| c.boot_entries)
+                })
+                .cloned(),
+        }
+    }
+
+    /// Open the picker for removing installed versions of the selection.
+    pub fn open_remove(&mut self) {
+        let Some(component) = self.removal_target() else {
+            self.note("nothing to remove for the selected entry");
+            return;
+        };
+        match self.app.removal_plan(&component) {
+            Ok(plan) if plan.versions.is_empty() => {
+                self.note(format!("{component}: nothing is installed"));
+            }
+            Ok(plan) => self.modal = Modal::Remove(RemovePicker::new(plan)),
+            Err(e) => self.note(format!(
+                "{component}: could not list installed versions: {e:#}"
+            )),
+        }
+    }
+
+    /// The confirmation for removing what was chosen in the picker.
+    pub fn plan_remove(&self, picker: &RemovePicker) -> Option<PendingAction> {
+        let chosen = picker.chosen_versions();
+        if chosen.is_empty() {
+            return None;
+        }
+        let component = &picker.plan.component;
+        let versions: Vec<String> = chosen.iter().map(|v| v.version.to_string()).collect();
+        let mut args = vec!["remove".to_string(), component.clone()];
+        args.extend(versions.iter().cloned());
+        args.push("--yes".into());
+        let mut a = self.action(
+            Verb::Remove,
+            component,
+            args,
+            format!("Uninstall {component} {}.", versions.join(", ")),
+        )?;
+        let mut details = Vec::new();
+        for v in &chosen {
+            details.push((Tone::Heading, format!("{component}  {}", v.version)));
+            details.push((Tone::Plain, format!("  removes {}", v.packages.join(", "))));
+            if v.roles.iter().any(|r| r.starts_with("pinned")) {
+                details.push((
+                    Tone::Faint,
+                    "  its multiversion.kernels pin is dropped with it".into(),
+                ));
+            }
+        }
+        details.push((Tone::Plain, String::new()));
+        for v in picker.plan.versions.iter().filter(|v| !v.removable()) {
+            details.push((
+                Tone::Good,
+                format!("✓ keeps {} ({})", v.version, v.roles.join(", ")),
+            ));
+        }
+        if let Some(esp) = &picker.plan.esp {
+            details.push((
+                Tone::Faint,
+                format!(
+                    "ESP {}: {} MB free of {} MB now",
+                    esp.path.display(),
+                    esp.free_mb,
+                    esp.total_mb
+                ),
+            ));
+        }
+        details.push((
+            Tone::Warn,
+            "zypper also removes anything that depends on these packages; its output is shown after"
+                .into(),
+        ));
+        a.details = details;
+        Some(a)
+    }
+
     /// Build the confirmation for a mutating action on the current selection.
     pub fn plan(&mut self, verb: Verb) -> Option<PendingAction> {
         if verb == Verb::SelfUpdate {
@@ -652,6 +817,7 @@ impl Dashboard {
 
         let (args, consequence) = match verb {
             Verb::SelfUpdate => return self.plan_self_update(),
+            Verb::Remove => return None,
             Verb::Update => (
                 vec!["update".to_string()],
                 "Refresh, apply every update your policies allow, and report anything gated. \
@@ -725,6 +891,7 @@ impl Dashboard {
         let list = members.join(", ");
         let (args, consequence) = match verb {
             Verb::SelfUpdate => return self.plan_self_update(),
+            Verb::Remove => return None,
             Verb::Update => (
                 vec!["update".to_string()],
                 "Refresh, apply every update your policies allow, and report anything gated.".to_string(),
@@ -768,6 +935,7 @@ pub enum Verb {
     MarkGood,
     Rollback,
     SelfUpdate,
+    Remove,
 }
 
 impl Verb {
@@ -778,6 +946,7 @@ impl Verb {
             Verb::MarkGood => "mark good",
             Verb::Rollback => "roll back",
             Verb::SelfUpdate => "update sluice",
+            Verb::Remove => "remove",
         }
     }
 }
@@ -792,6 +961,65 @@ mod tests {
         assert_eq!(Tab::Log.next(), Tab::Overview);
         assert_eq!(Tab::Overview.prev(), Tab::Log);
         assert_eq!(Tab::Lineage.index(), 1);
+    }
+
+    fn version(v: &str, blockers: &[&str]) -> InstalledVersion {
+        InstalledVersion {
+            version: crate::version::Evr::parse(v),
+            packages: vec![format!("kernel-default-{v}.x86_64")],
+            roles: Vec::new(),
+            blockers: blockers.iter().map(|b| b.to_string()).collect(),
+        }
+    }
+
+    fn picker() -> RemovePicker {
+        RemovePicker::new(RemovalPlan {
+            component: "kernel".into(),
+            versions: vec![
+                version("7.0.12-1.1", &["it is the rollback target"]),
+                version("7.2.10-1.1", &[]),
+                version("7.2.11-1.1", &["it is the running kernel"]),
+                version("7.2.9-1.1", &[]),
+            ],
+            esp: None,
+        })
+    }
+
+    #[test]
+    fn the_remove_picker_starts_on_something_removable() {
+        let p = picker();
+        assert_eq!(p.cursor, 1);
+        assert!(p.chosen_versions().is_empty());
+    }
+
+    #[test]
+    fn a_version_that_must_stay_cannot_be_chosen() {
+        let mut p = picker();
+        p.up();
+        p.toggle();
+        assert!(p.chosen_versions().is_empty());
+        p.down();
+        p.toggle();
+        let chosen: Vec<String> = p
+            .chosen_versions()
+            .iter()
+            .map(|v| v.version.to_string())
+            .collect();
+        assert_eq!(chosen, vec!["7.2.10-1.1"]);
+    }
+
+    #[test]
+    fn choosing_all_takes_only_the_removable_and_toggles_back() {
+        let mut p = picker();
+        p.toggle_all();
+        let chosen: Vec<String> = p
+            .chosen_versions()
+            .iter()
+            .map(|v| v.version.to_string())
+            .collect();
+        assert_eq!(chosen, vec!["7.2.10-1.1", "7.2.9-1.1"]);
+        p.toggle_all();
+        assert!(p.chosen_versions().is_empty());
     }
 
     #[test]

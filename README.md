@@ -113,12 +113,20 @@ nothing is trapped behind the interactive UI:
 | `sluice promote kernel` | Cross the gate. Asks first, shows the lineage first |
 | `sluice mark-good kernel [VER]` | Vault it, pin it, record it as the rollback target |
 | `sluice rollback kernel [--remove]` | Boot the known-good version and hold its series again |
+| `sluice remove kernel [VER...]` | List installed kernels and which can go; uninstall old ones to free the ESP |
 | `sluice health [KERNEL]` | Boot evidence per kernel version |
 | `sluice check [--force]` | Headless; notifies about anything needing attention |
 | `sluice migrate [--known-good C=V] [--undo]` | Adopt an existing manual lock setup, reversibly |
 | `sluice repair` | Restore locks left off by an interrupted run, and the boot default |
 
 `promote`, `mark-good` and `rollback` also take the name of a *bundle* (below).
+
+`remove` is for making room, typically on a small ESP before promoting to a new
+series (the new kernel is installed beside the old ones before anything is
+purged, and `promote` warns when the ESP is low). With no version it lists what
+is installed. It refuses the running kernel, the known-good one, the one under
+test (use `rollback --remove`), and the newest one, which the next update would
+only reinstall. A `multiversion.kernels` pin on a removed version is dropped with it.
 
 Read-only commands run unprivileged. Mutating ones need root and say so. The
 dashboard runs unprivileged and re-executes itself under `pkexec` or `sudo` for

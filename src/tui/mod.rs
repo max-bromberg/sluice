@@ -204,6 +204,28 @@ fn handle_key(terminal: &mut Tui, d: &mut Dashboard, key: KeyEvent) -> Result<()
             }
             return Ok(());
         }
+        Modal::Remove(mut picker) => {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => picker.down(),
+                KeyCode::Up | KeyCode::Char('k') => picker.up(),
+                KeyCode::Char(' ') => picker.toggle(),
+                KeyCode::Char('a') => picker.toggle_all(),
+                KeyCode::Enter => match d.plan_remove(&picker) {
+                    Some(action) => {
+                        d.modal = Modal::Confirm(action);
+                        return Ok(());
+                    }
+                    None => d.note("choose a version to remove with space first"),
+                },
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    d.modal = Modal::None;
+                    return Ok(());
+                }
+                _ => {}
+            }
+            d.modal = Modal::Remove(picker);
+            return Ok(());
+        }
         Modal::Help | Modal::Output { .. } => {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                 d.modal = Modal::None;
@@ -268,6 +290,10 @@ fn handle_key(terminal: &mut Tui, d: &mut Dashboard, key: KeyEvent) -> Result<()
         }
         KeyCode::Char('U') => {
             propose(d, Verb::SelfUpdate);
+            return Ok(());
+        }
+        KeyCode::Char('x') => {
+            d.open_remove();
             return Ok(());
         }
         _ => {}

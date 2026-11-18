@@ -761,3 +761,129 @@ fn a_reboot_is_called_for_when_the_running_kernel_is_behind() {
     app.running_kernel = Some("7.2.6-1-default".into());
     assert!(app.status(now()).unwrap().reboot_needed.is_none());
 }
+
+/// Three kernels installed, the way a small ESP fills up: the known-good
+/// 7.0.12, a 7.2.0 left behind (pinned by hand), and the running 7.2.6.
+fn three_kernels(f: &Fixture) -> std::rc::Rc<MockBackend> {
+    std::fs::write(
+        &f.config.boot.package_manager_conf,
+        "multiversion.kernels = latest,latest-1,running,7.0.12-1.1,7.2.0-1.1\n",
+    )
+    .unwrap();
+    std::rc::Rc::new(MockBackend::with_packages(vec![
+        pkg("kernel-default", "7.0.12-1.1", true),
+        pkg("kernel-default", "7.2.0-1.1", true),
+        pkg("kernel-devel", "7.2.0-1.1", true),
+        offered("kernel-default", "7.2.6-1.1", true),
+        offered("kernel-devel", "7.2.6-1.1", true),
+    ]))
+}
+
+/// `remove` lists every installed version, and only offers the ones whose
+/// removal takes away nothing sluice relies on.
+#[test]
+fn remove_keeps_the_running_known_good_and_newest_kernels() {
+    let f = Fixture::new();
+    let backend = three_kernels(&f);
+    let mut app = App::new(f.config.clone(), false)
+        .unwrap()
+        .with_backend(Box::new(std::rc::Rc::clone(&backend)));
+    app.running_kernel = Some("7.2.6-1-default".into());
+    app.state.component_mut("kernel").known_good = Some(Evr::parse("7.0.12-1.1"));
+
+    let plan = app.removal_plan("kernel").unwrap();
+    let removable: Vec<String> = plan.removable().map(|v| v.version.to_string()).collect();
+    assert_eq!(removable, vec!["7.2.0-1.1"]);
+
+    let kg = plan.find("7.0.12").unwrap();
+    assert!(
+        kg.roles.contains(&"known-good".to_string()),
+        "{:?}",
+        kg.roles
+    );
+    let newest = plan.find("7.2.6-1-default").unwrap();
+    assert!(newest.roles.contains(&"running".to_string()));
+    assert!(newest.roles.contains(&"newest".to_string()));
+    assert!(plan
+        .find("7.2.0")
+        .unwrap()
+        .roles
+        .contains(&"pinned against purge-kernels".to_string()));
+
+    // One refused version stops the whole request.
+    let err = app
+        .remove_versions("kernel", &["7.2.0".into(), "7.0.12".into()], now())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("rollback target"), "got: {err}");
+    let err = app
+        .remove_versions("kernel", &["7.2.6".into()], now())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("running kernel"), "got: {err}");
+    assert!(backend.removals.borrow().is_empty());
+}
+
+/// Removing a version takes its whole family, and its pin with it.
+#[test]
+fn remove_uninstalls_the_family_and_drops_its_pin() {
+    let f = Fixture::new();
+    let backend = three_kernels(&f);
+    let mut app = App::new(f.config.clone(), false)
+        .unwrap()
+        .with_backend(Box::new(std::rc::Rc::clone(&backend)));
+    app.running_kernel = Some("7.2.6-1-default".into());
+    app.state.component_mut("kernel").known_good = Some(Evr::parse("7.0.12-1.1"));
+
+    let report = app
+        .remove_versions("kernel", &["7.2.0".into()], now())
+        .unwrap();
+    assert_eq!(report.removed, vec![Evr::parse("7.2.0-1.1")]);
+    assert_eq!(
+        backend.removals.borrow().clone(),
+        vec![vec![
+            "kernel-default=7.2.0-1.1".to_string(),
+            "kernel-devel=7.2.0-1.1".to_string()
+        ]]
+    );
+    let mv = sluice::boot::read_multiversion(&app.config.boot.package_manager_conf)
+        .unwrap()
+        .unwrap();
+    assert_eq!(mv.render(), "latest,latest-1,running,7.0.12-1.1");
+
+    let left: Vec<String> = app
+        .removal_plan("kernel")
+        .unwrap()
+        .versions
+        .iter()
+        .map(|v| v.version.to_string())
+        .collect();
+    assert_eq!(left, vec!["7.0.12-1.1", "7.2.6-1.1"]);
+}
+
+/// Promoting onto a nearly full ESP is flagged before the question is asked.
+#[test]
+fn promote_preview_warns_when_the_esp_is_nearly_full() {
+    let mut f = Fixture::new();
+    std::fs::create_dir_all(&f.config.boot.esp_path).unwrap();
+    // Whatever the test machine has free, it is less than this.
+    f.config.boot.esp_warn_free_mb = u64::MAX / 2;
+    let backend = std::rc::Rc::new(f.tumbleweed_on_7_2());
+    let mut app = App::new(f.config.clone(), false)
+        .unwrap()
+        .with_backend(Box::new(std::rc::Rc::clone(&backend)));
+    app.update(now()).unwrap();
+    app.mark_good("kernel", None, now()).unwrap();
+    tumbleweed_jumps_to_7_3(&backend);
+
+    let preview = &app.promote_preview(&["kernel".to_string()], now()).unwrap()[0];
+    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+    assert!(
+        preview
+            .warnings
+            .iter()
+            .any(|w| w.contains("ESP") && w.contains("sluice remove kernel")),
+        "{:?}",
+        preview.warnings
+    );
+}

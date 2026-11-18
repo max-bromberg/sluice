@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 
-use crate::app::{App, CheckReport, MigrateReport, Status, UpdateReport};
+use crate::app::{App, CheckReport, MigrateReport, RemovalPlan, Status, UpdateReport};
 use crate::config::Config;
 use crate::lineage::LineageView;
 use crate::notify::Urgency;
@@ -84,6 +84,17 @@ pub enum Command {
         #[arg(long)]
         remove: bool,
     },
+    /// Uninstall old versions of a component, e.g. to free ESP space for a
+    /// new kernel. With no version, lists what is installed and what can go.
+    Remove {
+        /// Component name, e.g. `kernel`.
+        component: String,
+        /// Versions to remove: `7.2.10-1.1`, or `7.2.10` when unambiguous.
+        versions: Vec<String>,
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Per-kernel boot evidence: uptime, unclean ends, crash records.
     Health {
         /// Limit to one kernel version.
@@ -155,6 +166,7 @@ impl Command {
                 | Command::Migrate { .. }
                 | Command::Repair
         ) || matches!(self, Command::SelfUpdate { check: false, .. })
+            || matches!(self, Command::Remove { versions, .. } if !versions.is_empty())
     }
 
     pub fn name(&self) -> &'static str {
@@ -166,6 +178,7 @@ impl Command {
             Command::Promote { .. } => "promote",
             Command::MarkGood { .. } => "mark-good",
             Command::Rollback { .. } => "rollback",
+            Command::Remove { .. } => "remove",
             Command::Health { .. } => "health",
             Command::Check { .. } => "check",
             Command::Migrate { .. } => "migrate",
@@ -567,6 +580,9 @@ pub fn render_promote_preview(previews: &[crate::app::PromotePreview], style: St
         for b in &p.blockers {
             out.push_str(&format!("  {}\n", style.red(&format!("✖ {b}"))));
         }
+        for w in &p.warnings {
+            out.push_str(&format!("  {}\n", style.yellow(&format!("⚠ {w}"))));
+        }
         if p.to.is_none() {
             continue;
         }
@@ -599,6 +615,67 @@ pub fn render_promote_preview(previews: &[crate::app::PromotePreview], style: St
         }
     }
     out.push('\n');
+    out
+}
+
+pub fn render_removal_plan(plan: &RemovalPlan, style: Style) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{}\n",
+        style.bold(&format!("{}  installed versions", plan.component))
+    ));
+    let width = plan
+        .versions
+        .iter()
+        .map(|v| v.version.to_string().len())
+        .max()
+        .unwrap_or(0);
+    for v in &plan.versions {
+        let version = format!("{:<width$}", v.version.to_string());
+        let roles = if v.roles.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", v.roles.join(", "))
+        };
+        if v.removable() {
+            out.push_str(&format!(
+                "  {version}  {}{}\n",
+                style.green("can remove"),
+                style.dim(&roles)
+            ));
+        } else {
+            out.push_str(&format!(
+                "  {version}  {}{}\n",
+                style.yellow("keep"),
+                style.dim(&roles)
+            ));
+            for b in &v.blockers {
+                out.push_str(&format!("    {}\n", style.dim(b)));
+            }
+        }
+    }
+    if let Some(esp) = &plan.esp {
+        out.push_str(&format!(
+            "ESP {}: {} MB free of {} MB ({}% used)\n",
+            esp.path.display(),
+            esp.free_mb,
+            esp.total_mb,
+            esp.used_percent()
+        ));
+    }
+    let removable: Vec<String> = plan.removable().map(|v| v.version.to_string()).collect();
+    if removable.is_empty() {
+        out.push_str(&format!("{}\n", style.dim("nothing can be removed")));
+    } else {
+        out.push_str(&format!(
+            "{}\n",
+            style.dim(&format!(
+                "remove with: sudo sluice remove {} {}",
+                plan.component,
+                removable.join(" ")
+            ))
+        ));
+    }
     out
 }
 
@@ -854,6 +931,100 @@ pub fn run(cli: Cli) -> Result<i32> {
                 }
             }
             println!("{}", style.dim("reboot to take effect."));
+        }
+
+        Command::Remove {
+            component,
+            versions,
+            yes,
+        } => {
+            let plan = app.removal_plan(&component)?;
+            if versions.is_empty() {
+                print!("{}", render_removal_plan(&plan, style));
+                return Ok(0);
+            }
+
+            // Check every request before asking, so the question is only put
+            // when the answer can be carried out.
+            let mut refused = false;
+            let mut chosen = Vec::new();
+            for r in &versions {
+                match plan.find(r) {
+                    None => {
+                        println!(
+                            "{}",
+                            style.red(&format!("✖ {component} {r} is not installed"))
+                        );
+                        refused = true;
+                    }
+                    Some(v) if !v.removable() => {
+                        println!(
+                            "{}",
+                            style.red(&format!(
+                                "✖ {component} {} must stay: {}",
+                                v.version,
+                                v.blockers.join("; ")
+                            ))
+                        );
+                        refused = true;
+                    }
+                    Some(v) => chosen.push(v),
+                }
+            }
+            if refused {
+                print!("\n{}", render_removal_plan(&plan, style));
+                return Ok(1);
+            }
+            for v in &chosen {
+                println!(
+                    "{} {component} {}: {}",
+                    style.bold("remove"),
+                    v.version,
+                    v.packages.join(", ")
+                );
+            }
+            if !yes
+                && !confirm(&format!(
+                    "Uninstall {} package(s)?",
+                    chosen.iter().map(|v| v.packages.len()).sum::<usize>()
+                ))?
+            {
+                println!("{}", style.dim("cancelled"));
+                return Ok(1);
+            }
+
+            let report = app.remove_versions(&component, &versions, now)?;
+            println!(
+                "{} {} {}",
+                style.green("removed"),
+                report.component,
+                report
+                    .removed
+                    .iter()
+                    .map(Evr::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            for n in &report.notes {
+                println!("  {}", style.dim(n));
+            }
+            match (&report.esp_before, &report.esp_after) {
+                (Some(b), Some(a)) => println!(
+                    "ESP {}: {} MB free, was {} MB",
+                    a.path.display(),
+                    a.free_mb,
+                    b.free_mb
+                ),
+                (Some(b), None) if cli.dry_run => println!(
+                    "{}",
+                    style.dim(&format!(
+                        "ESP {}: {} MB free now",
+                        b.path.display(),
+                        b.free_mb
+                    ))
+                ),
+                _ => {}
+            }
         }
 
         Command::Health { kernel } => {
