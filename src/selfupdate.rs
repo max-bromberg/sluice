@@ -198,6 +198,26 @@ pub fn previous_path(state_dir: &Path) -> PathBuf {
     state_dir.join("previous-sluice")
 }
 
+/// What `binary --version` prints, or empty if it does not run.
+///
+/// A file that was just written can fail to execute with ETXTBSY ("text file
+/// busy") for a moment: a process forked elsewhere in the meantime holds a
+/// copy of the write handle until it execs. That says nothing about the
+/// binary, so it is retried rather than reported as a binary that does not run.
+fn reported_version(binary: &Path) -> String {
+    const ETXTBSY: i32 = 26;
+    for attempt in 0..20 {
+        match std::process::Command::new(binary).arg("--version").output() {
+            Ok(o) => return String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt < 19 => {
+                std::thread::sleep(std::time::Duration::from_millis(10 << attempt.min(4)));
+            }
+            Err(_) => break,
+        }
+    }
+    String::new()
+}
+
 /// Swap `new` in for the binary at `target`, keeping the old one at
 /// `previous`. The new binary is run first: a download that does not start,
 /// or reports another version, never replaces anything.
@@ -209,14 +229,7 @@ pub fn install(new: &[u8], expected_version: &str, target: &Path, previous: &Pat
     std::fs::write(&staged, new).with_context(|| format!("writing {}", staged.display()))?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
 
-    let out = std::process::Command::new(&staged)
-        .arg("--version")
-        .output();
-    let reported = out
-        .as_ref()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let reported = reported_version(&staged);
     if !reported.ends_with(expected_version) {
         let _ = std::fs::remove_file(&staged);
         anyhow::bail!(
@@ -251,11 +264,7 @@ pub fn rollback(target: &Path, previous: &Path) -> Result<String> {
     let staged = dir.join(".sluice-rollback");
     std::fs::copy(previous, &staged)?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
-    let version = std::process::Command::new(&staged)
-        .arg("--version")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let version = reported_version(&staged);
     std::fs::rename(&staged, target)?;
     std::fs::remove_file(previous)?;
     Ok(version)
