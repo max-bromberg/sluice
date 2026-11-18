@@ -44,7 +44,23 @@ pub fn date_of(x: f64) -> NaiveDate {
 }
 
 pub fn today() -> NaiveDate {
+    #[cfg(test)]
+    if let Some(d) = FIXED_TODAY.with(std::cell::Cell::get) {
+        return d;
+    }
     chrono::Local::now().date_naive()
+}
+
+#[cfg(test)]
+thread_local! {
+    static FIXED_TODAY: std::cell::Cell<Option<NaiveDate>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fix "today" for the calling test's thread, so what is on screen does not
+/// depend on when the tests run.
+#[cfg(test)]
+pub fn set_today(d: NaiveDate) {
+    FIXED_TODAY.with(|t| t.set(Some(d)));
 }
 
 pub fn ease_out(t: f64) -> f64 {

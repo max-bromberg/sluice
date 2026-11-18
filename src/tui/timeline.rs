@@ -2170,6 +2170,8 @@ mod tests {
     }
 
     fn view() -> TimelineView {
+        // The day after 7.2.7, with 7.2.8 expected next week.
+        super::super::canvas::set_today(d("2026-09-22"));
         let lane = Lane {
             series: "7.2".into(),
             start: Some(d("2026-08-17")),
