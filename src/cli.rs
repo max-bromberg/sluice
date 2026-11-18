@@ -95,6 +95,10 @@ pub enum Command {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Print the boot entries as JSON. Used by the dashboard, which runs as
+    /// a user, to see them through one escalated call.
+    #[command(hide = true)]
+    BootEntries,
     /// Per-kernel boot evidence: uptime, unclean ends, crash records.
     Health {
         /// Limit to one kernel version.
@@ -179,6 +183,7 @@ impl Command {
             Command::MarkGood { .. } => "mark-good",
             Command::Rollback { .. } => "rollback",
             Command::Remove { .. } => "remove",
+            Command::BootEntries => "boot-entries",
             Command::Health { .. } => "health",
             Command::Check { .. } => "check",
             Command::Migrate { .. } => "migrate",
@@ -397,9 +402,10 @@ pub fn render_status(s: &Status, style: Style) -> String {
         out.push_str(&format!(
             "{}\n",
             style.cyan(&format!(
-                "sluice {} is available (this is {}) — `sudo sluice self-update`",
+                "sluice {} is available (this is {}) — `{}`",
                 r.version(),
-                crate::selfupdate::CURRENT
+                crate::selfupdate::CURRENT,
+                privilege::sudo("self-update")
             ))
         ));
     }
@@ -665,9 +671,9 @@ pub fn render_removal_plan(plan: &RemovalPlan, style: Style) -> String {
         out.push_str(&format!(
             "{}\n",
             style.yellow(&format!(
-                "boot entries need root to read: `sudo sluice remove {}` also lists kernels \
+                "boot entries need root to read: `{}` also lists kernels \
                  other snapshots still hold on the ESP",
-                plan.component
+                privilege::sudo(&format!("remove {}", plan.component))
             ))
         ));
     }
@@ -682,14 +688,22 @@ pub fn render_removal_plan(plan: &RemovalPlan, style: Style) -> String {
     }
     let removable: Vec<String> = plan.removable().map(|v| v.version.to_string()).collect();
     if removable.is_empty() {
-        out.push_str(&format!("{}\n", style.dim("nothing can be removed")));
+        let what = if plan.cleans_entries && !plan.entries_read {
+            "nothing installed can be removed"
+        } else {
+            "nothing can be removed"
+        };
+        out.push_str(&format!("{}\n", style.dim(what)));
     } else {
         out.push_str(&format!(
             "{}\n",
             style.dim(&format!(
-                "remove with: sudo sluice remove {} {}",
-                plan.component,
-                removable.join(" ")
+                "remove with: {}",
+                privilege::sudo(&format!(
+                    "remove {} {}",
+                    plan.component,
+                    removable.join(" ")
+                ))
             ))
         ));
     }
@@ -950,6 +964,17 @@ pub fn run(cli: Cli) -> Result<i32> {
             println!("{}", style.dim("reboot to take effect."));
         }
 
+        Command::BootEntries => {
+            let entries =
+                crate::boot::entries(&app.config.boot, &mut app.runner)?.with_context(|| {
+                    format!(
+                        "the boot entries could not be read; they need root: `{}`",
+                        privilege::sudo("boot-entries")
+                    )
+                })?;
+            println!("{}", serde_json::to_string(&entries)?);
+        }
+
         Command::Remove {
             component,
             versions,
@@ -968,9 +993,17 @@ pub fn run(cli: Cli) -> Result<i32> {
             for r in &versions {
                 match plan.find(r) {
                     None => {
+                        let unseen = if plan.cleans_entries && !plan.entries_read {
+                            format!(
+                                "; whether older snapshots still hold it on the ESP needs root to see: `{}`",
+                                privilege::sudo(&format!("remove {component} {}", versions.join(" ")))
+                            )
+                        } else {
+                            String::new()
+                        };
                         println!(
                             "{}",
-                            style.red(&format!("✖ {component} {r} is not installed"))
+                            style.red(&format!("✖ {component} {r} is not installed{unseen}"))
                         );
                         refused = true;
                     }
@@ -1207,7 +1240,7 @@ fn self_update(
         println!("  {}", style.dim(&release.html_url));
     }
     if check {
-        println!("`sudo sluice self-update` installs it.");
+        println!("`{}` installs it.", privilege::sudo("self-update"));
         return Ok(1);
     }
 
@@ -1218,7 +1251,10 @@ fn self_update(
         "once to confirm it works, then replace {}.",
         target.display()
     );
-    println!("The current version is kept: `sudo sluice self-update --rollback` puts it back.");
+    println!(
+        "The current version is kept: `{}` puts it back.",
+        privilege::sudo("self-update --rollback")
+    );
     if !yes && !confirm("Install it?")? {
         println!("{}", style.dim("nothing was changed"));
         return Ok(1);

@@ -93,6 +93,10 @@ sluice self-update --check         # only says whether one is out
 sudo sluice self-update --rollback # puts the previous version back
 ```
 
+On Tumbleweed, sudo's default `secure_path` leaves out `/usr/local/bin`, so
+`sudo sluice` is "command not found": use `sudo /usr/local/bin/sluice …`.
+sluice's own hints spell the path out, and the dashboard escalates with it.
+
 The download is checked against the release's published SHA-256 sums, the new
 binary is run once to confirm it starts and reports the right version before it
 replaces anything, and the version it replaces is kept for `--rollback`. `U` in

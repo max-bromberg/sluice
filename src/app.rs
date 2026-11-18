@@ -1469,6 +1469,17 @@ impl App {
     /// while other snapshots' boot entries still use it, since those keep its
     /// files on the ESP. Reading the entries needs root.
     pub fn removal_plan(&mut self, component: &str) -> Result<RemovalPlan> {
+        self.removal_plan_with(component, None)
+    }
+
+    /// [`App::removal_plan`], with boot entries read elsewhere — by a
+    /// privileged `sluice boot-entries`, for a dashboard running as a user.
+    pub fn removal_plan_with(
+        &mut self,
+        component: &str,
+        entries: Option<Vec<BootEntry>>,
+    ) -> Result<RemovalPlan> {
+        let given = entries;
         let cfg = self.config.component(component)?.clone();
         let anchor = cfg.anchor.clone().with_context(|| {
             format!("`{component}` has no anchor package, so its installed versions cannot be told apart")
@@ -1494,10 +1505,12 @@ impl App {
 
         let cleans_entries = cfg.boot_entries
             && boot::detect_manager(&self.config.boot) == crate::config::BootManager::Sdbootutil;
-        let entries = if cleans_entries {
-            boot::entries(&self.config.boot, &mut self.runner).unwrap_or(None)
-        } else {
-            None
+        let entries = match given {
+            Some(e) if cleans_entries => Some(e),
+            _ if cleans_entries => {
+                boot::entries(&self.config.boot, &mut self.runner).unwrap_or(None)
+            }
+            _ => None,
         };
         let entries_read = entries.is_some();
         let entries = entries.unwrap_or_default();
@@ -2405,9 +2418,10 @@ impl App {
                 alerts.push((
                     Urgency::Info,
                     format!(
-                        "sluice {} is available (this is {}); `sudo sluice self-update` installs it",
+                        "sluice {} is available (this is {}); `{}` installs it",
                         r.version(),
-                        crate::selfupdate::CURRENT
+                        crate::selfupdate::CURRENT,
+                        crate::privilege::sudo("self-update")
                     ),
                 ));
                 announce_release = Some(r.version().to_string());

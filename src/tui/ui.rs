@@ -705,6 +705,14 @@ fn draw_footer(f: &mut Frame, area: Rect, d: &Dashboard) {
             ("?", "help"),
             ("q", "quit"),
         ],
+        Modal::Remove(ref p) if p.plan.cleans_entries && !p.plan.entries_read => &[
+            ("↑↓", "move"),
+            ("space", "choose"),
+            ("a", "all"),
+            ("s", "read snapshots"),
+            ("enter", "continue"),
+            ("esc", "cancel"),
+        ],
         Modal::Remove(_) => &[
             ("↑↓", "move"),
             ("space", "choose"),
@@ -888,17 +896,25 @@ fn draw_remove(f: &mut Frame, picker: &super::state::RemovePicker) {
     if picker.plan.cleans_entries && !picker.plan.entries_read {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            format!(
-                "kernels only other snapshots still hold are listed by `sudo sluice remove {}`",
-                picker.plan.component
-            ),
-            Style::default().fg(MUTED),
+            "older snapshots may still hold kernels that are no longer installed on the ESP;",
+            Style::default().fg(GATED),
         ));
+        lines.push(Line::from(vec![
+            Span::styled(" s ", Style::default().fg(Color::Black).bg(GATED)),
+            Span::styled(
+                " read every snapshot's boot entries to list them (asks for your password)",
+                Style::default().fg(GATED),
+            ),
+        ]));
     }
     if picker.plan.removable().next().is_none() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "nothing can be removed",
+            if picker.plan.cleans_entries && !picker.plan.entries_read {
+                "nothing installed can be removed"
+            } else {
+                "nothing can be removed"
+            },
             Style::default().fg(MUTED),
         ));
     }

@@ -27,10 +27,39 @@ pub fn is_root() -> bool {
 pub fn require_root(command: &str) -> Result<()> {
     anyhow::ensure!(
         is_root(),
-        "`sluice {command}` changes the system and must run as root. \
-         Try `sudo sluice {command}`."
+        "`sluice {command}` changes the system and must run as root. Try `{}`.",
+        sudo(command)
     );
     Ok(())
+}
+
+/// `sudo sluice <args>`, spelled so that sudo finds it.
+///
+/// sudo looks commands up in its `secure_path`, not the user's PATH, and
+/// Tumbleweed's default leaves out /usr/local/bin, where sluice installs
+/// itself: there, a bare `sudo sluice` is "command not found". Outside the
+/// directories every `secure_path` has, the full path is given.
+pub fn sudo(args: &str) -> String {
+    format!(
+        "sudo {} {args}",
+        sudo_program(current_exe().ok().as_deref())
+    )
+}
+
+fn sudo_program(exe: Option<&std::path::Path>) -> String {
+    const ALWAYS_ON_SECURE_PATH: [&str; 4] = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"];
+    match exe {
+        Some(p)
+            if !p.parent().is_some_and(|d| {
+                ALWAYS_ON_SECURE_PATH
+                    .iter()
+                    .any(|s| d == std::path::Path::new(s))
+            }) =>
+        {
+            p.display().to_string()
+        }
+        _ => "sluice".to_string(),
+    }
 }
 
 /// Which escalation helper to use.
@@ -155,5 +184,16 @@ mod tests {
             &["update".into()],
         );
         assert_eq!(cmd.display(), "/usr/bin/sluice update");
+    }
+
+    #[test]
+    fn sudo_is_given_a_path_it_can_find() {
+        use std::path::Path;
+        assert_eq!(sudo_program(Some(Path::new("/usr/bin/sluice"))), "sluice");
+        assert_eq!(
+            sudo_program(Some(Path::new("/usr/local/bin/sluice"))),
+            "/usr/local/bin/sluice"
+        );
+        assert_eq!(sudo_program(None), "sluice");
     }
 }

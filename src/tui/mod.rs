@@ -210,6 +210,12 @@ fn handle_key(terminal: &mut Tui, d: &mut Dashboard, key: KeyEvent) -> Result<()
                 KeyCode::Up | KeyCode::Char('k') => picker.up(),
                 KeyCode::Char(' ') => picker.toggle(),
                 KeyCode::Char('a') => picker.toggle_all(),
+                KeyCode::Char('s') if picker.plan.cleans_entries && !picker.plan.entries_read => {
+                    let component = picker.plan.component.clone();
+                    d.modal = Modal::None;
+                    read_boot_entries(terminal, d, &component)?;
+                    return Ok(());
+                }
                 KeyCode::Enter => match d.plan_remove(&picker) {
                     Some(action) => {
                         d.modal = Modal::Confirm(action);
@@ -334,6 +340,71 @@ fn propose(d: &mut Dashboard, verb: Verb) {
             verb.label()
         )),
     }
+}
+
+/// Read every snapshot's boot entries through one escalated
+/// `sluice boot-entries`, then reopen the remove picker with them, so kernels
+/// that only older snapshots still hold on the ESP can be chosen too.
+fn read_boot_entries(terminal: &mut Tui, d: &mut Dashboard, component: &str) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    leave(terminal)?;
+    let exe = crate::privilege::current_exe()?;
+    let config = d.app.config.source.clone();
+    let args = vec!["boot-entries".to_string()];
+    let cmd = crate::privilege::escalated(d.escalator, &exe, config.as_deref(), &args);
+    println!("\n$ {}\n", cmd.display());
+    println!("Reading the boot entries of every snapshot needs root.");
+
+    // stdout carries the answer; the password prompt goes to the terminal.
+    let out = Command::new(&cmd.program)
+        .args(&cmd.args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output();
+    let entries: std::result::Result<Vec<crate::boot::BootEntry>, String> = match out {
+        Ok(o) if o.status.success() => serde_json::from_slice(&o.stdout)
+            .map_err(|e| format!("could not read the boot entries: {e}")),
+        Ok(o) => Err(format!(
+            "reading the boot entries exited with status {}{}",
+            o.status.code().unwrap_or(-1),
+            if o.stdout.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", String::from_utf8_lossy(&o.stdout).trim())
+            }
+        )),
+        Err(e) => Err(format!(
+            "reading the boot entries could not be started: {e}"
+        )),
+    };
+
+    *terminal = enter()?;
+    terminal.clear()?;
+
+    let plan = entries.and_then(|e| {
+        d.app
+            .removal_plan_with(component, Some(e))
+            .map_err(|e| format!("{component}: {e:#}"))
+    });
+    match plan {
+        Ok(plan) => {
+            d.note(format!(
+                "{component}: read the boot entries of every snapshot"
+            ));
+            d.modal = Modal::Remove(state::RemovePicker::new(plan));
+        }
+        Err(msg) => {
+            d.note(msg.clone());
+            d.modal = Modal::Output {
+                title: "read boot entries".into(),
+                body: msg,
+                ok: false,
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Hand the terminal to an escalated `sluice` invocation, then take it back.
